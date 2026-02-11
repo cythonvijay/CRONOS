@@ -20,9 +20,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Get changed files
+      - name: Get changed Python files
         id: changed-files
         run: |
           if [ "${{ github.event_name }}" == "pull_request" ]; then
@@ -78,11 +78,13 @@ jobs:
             cat <<EOF > /tmp/payload.json
 {
   "old_code": $(python3 - << 'EOF2'
-import json; print(json.dumps(open('/tmp/old_code.py').read()))
+import json
+print(json.dumps(open('/tmp/old_code.py').read()))
 EOF2
 ),
   "new_code": $(python3 - << 'EOF2'
-import json; print(json.dumps(open('/tmp/new_code.py').read()))
+import json
+print(json.dumps(open('/tmp/new_code.py').read()))
 EOF2
 ),
   "mode": "$ANALYSIS_MODE"
@@ -94,15 +96,18 @@ EOF
               --data-binary @/tmp/payload.json)
 
             RISK=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys; print(json.loads(sys.stdin.read()).get("risk", 0))
+import json, sys
+print(json.loads(sys.stdin.read()).get("risk", 0))
 EOF
 )
             STATUS=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys; print(json.loads(sys.stdin.read()).get("status", "UNKNOWN"))
+import json, sys
+print(json.loads(sys.stdin.read()).get("status", "UNKNOWN"))
 EOF
 )
             SUMMARY=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys; data=json.loads(sys.stdin.read())
+import json, sys
+data=json.loads(sys.stdin.read())
 print("\n".join(data.get("summary", [])))
 EOF
 )
@@ -124,7 +129,7 @@ EOF
               echo "---"
             } >> cronos-reports/summary.md
 
-            echo "$RESPONSE" > "cronos-reports/${file//\//_}_analysis.json
+            echo "$RESPONSE" > "cronos-reports/${file//\//_}_analysis.json"
 
           done < changed_files.txt
 
