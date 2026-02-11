@@ -30,7 +30,13 @@ import google.generativeai as genai
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Configure Gemini with the correct SDK pattern
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    gemini_model = None
+
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
 
 # ============================================================================
@@ -1417,14 +1423,11 @@ class ComplianceAnalyzer:
 
 def call_gemini(prompt: str) -> Tuple[str, str]:
     """Call Gemini API with error handling"""
-    if not gemini_client:
+    if not gemini_model:
         raise Exception("Gemini not configured")
 
     try:
-        r = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt
-        )
+        r = gemini_model.generate_content(prompt)
         return r.text.strip(), "Gemini"
     except Exception as e:
         raise Exception(f"Gemini API Error: {str(e)}")
@@ -1459,7 +1462,7 @@ def ai(prompt: str) -> Tuple[str, str]:
     CRITICAL: AI is used ONLY for explanation, NOT for risk decisions.
     All risk scoring is done by the AST-based analyzers.
     """
-    if gemini_client:
+    if gemini_model:
         try:
             return call_gemini(prompt)
         except Exception as e:
@@ -2063,7 +2066,7 @@ async def health():
         "features": {
             "web_ui": "Full-featured analysis with AI explanations",
             "ci_cd": "Optimized endpoint for GitHub Actions",
-            "gemini": gemini_client is not None,
+            "gemini": gemini_model is not None,
             "openrouter": OPENROUTER_ENABLED,
             "constraints": ["no_behavior_change", "allow_boundary_change"],
             "analysis_modes": ["standard", "deep"],
@@ -2121,7 +2124,7 @@ async def startup_event():
     print("✅ CRONOS v5.1.0 - PRODUCTION GRADE with CI/CD INTEGRATION")
     print("=" * 80)
     print(f"📁 Report directory: {REPORT_DIR}")
-    print(f"🤖 Gemini: {'✅ Enabled' if gemini_client else '❌ Disabled'}")
+    print(f"🤖 Gemini: {'✅ Enabled' if gemini_model else '❌ Disabled'}")
     print(f"🤖 OpenRouter: {'✅ Enabled' if OPENROUTER_ENABLED else '❌ Disabled'}")
     print()
     print("🎯 KEY FEATURES:")
