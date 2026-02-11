@@ -20,7 +20,8 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-from google import genai
+import google.generativeai as genai
+
 
 # ============================================================================
 # API KEYS
