@@ -2046,7 +2046,12 @@ async def analyze_ci(request: Request):
         }
 
         print(f"[CI] Mode={mode}, Risk={risk}, Status={status}, Findings={len(findings)}")
-        return JSONResponse(content=response, status_code=200)
+        print("FINAL RESPONSE:", response)
+        return JSONResponse(
+            content=response,
+            status_code=200,
+            headers={"Content-Type": "application/json"}
+        )
 
     except Exception as e:
         print(f"[ERROR] analyze_ci failed: {str(e)}")
