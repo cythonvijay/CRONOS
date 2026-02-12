@@ -1936,33 +1936,81 @@ async def analyze(req: AnalyzeRequest):
         raise HTTPException(500, f"Internal analysis error: {str(e)}")
 
 
+# ============================================================================
+# FIX 1: /analyze_ci — always return CRONOS-format JSON, never bare FastAPI errors
+# FIX 3: GET handler for /analyze_ci — DX polish for browser/health checks
+# ============================================================================
+
+@app.get("/analyze_ci")
+async def analyze_ci_get():
+    """
+    GET handler for /analyze_ci — returns usage info instead of 405.
+    Useful for browser health checks and debugging.
+    """
+    return {
+        "status": "OK",
+        "message": "POST-only endpoint. Send a JSON body with old_code, new_code, and mode.",
+        "example": {
+            "old_code": "x > 10",
+            "new_code": "x >= 10",
+            "mode": "STRICT"
+        }
+    }
+
+
 @app.post("/analyze_ci")
 async def analyze_ci(request: Request):
     """
     CI/CD optimized endpoint for GitHub Actions.
-    
+
+    Always returns CRONOS-format JSON — never bare FastAPI validation errors.
     Accepts: {"old_code": "...", "new_code": "...", "mode": "STRICT"}
     Returns: {"risk": 60, "status": "FAIL", "findings": [...]}
     """
+
+    # ── FIX 1: Parse body — return CRONOS error if body is invalid/missing ──
     try:
-        # Parse JSON body
-        try:
-            body = await request.json()
-        except Exception:
-            raise HTTPException(400, "Invalid JSON payload")
-        
-        # Validate required fields
-        old_code = body.get("old_code", "")
-        new_code = body.get("new_code", "")
-        mode = body.get("mode", "STRICT").upper()
-        
-        if not new_code:
-            raise HTTPException(400, "new_code is required")
-        
-        # Validate mode
-        if mode not in ["STRICT", "BOUNDARY", "CONTRACT"]:
-            mode = "STRICT"
-        
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "FAIL",
+                "risk": 100,
+                "findings_count": 1,
+                "summary": ["Invalid or missing JSON body"],
+                "pass": False,
+                "warn": False,
+                "fail": True,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+
+    old_code = body.get("old_code", "")
+    new_code = body.get("new_code", "")
+    mode = str(body.get("mode", "STRICT")).upper()
+
+    # ── FIX 1: Validate new_code — return CRONOS error, not FastAPI detail ──
+    if not new_code:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "FAIL",
+                "risk": 100,
+                "findings_count": 1,
+                "summary": ["new_code is required"],
+                "pass": False,
+                "warn": False,
+                "fail": True,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+
+    # Validate / default mode
+    if mode not in ["STRICT", "BOUNDARY", "CONTRACT"]:
+        mode = "STRICT"
+
+    try:
         # Build constraints based on mode
         if mode == "STRICT":
             constraints = Constraint(no_behavior_change=True, allow_boundary_change=False)
@@ -1970,29 +2018,20 @@ async def analyze_ci(request: Request):
             constraints = Constraint(no_behavior_change=False, allow_boundary_change=True)
         else:  # CONTRACT
             constraints = Constraint(no_behavior_change=False, allow_boundary_change=False)
-        
-        # Handle empty old_code (first commit)
+
+        # Handle empty old_code (first commit — use COMPLIANCE mode)
         if not old_code.strip():
-            # Use COMPLIANCE mode for first commit
             analyzer = ComplianceAnalyzer()
             findings, raw_risk, metadata = analyzer.analyze(new_code, "")
         else:
-            # Use CHANGE mode for diffs
             analyzer = ChangeAnalyzer()
             findings, raw_risk, metadata = analyzer.analyze(old_code, new_code, constraints)
-        
-        # Normalize risk
+
         risk = normalize_risk(raw_risk)
         status = get_status(risk)
-        
-        # Build summary
-        summary = []
-        if findings:
-            summary = [f.findings[0] for f in findings[:5]]
-        else:
-            summary = ["No issues detected"]
-        
-        # Build response
+
+        summary = [f.findings[0] for f in findings[:5]] if findings else ["No issues detected"]
+
         response = {
             "risk": risk,
             "status": status,
@@ -2005,17 +2044,26 @@ async def analyze_ci(request: Request):
             "metadata": metadata,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
-        
-        # Log for debugging
+
         print(f"[CI] Mode={mode}, Risk={risk}, Status={status}, Findings={len(findings)}")
-        
         return JSONResponse(content=response, status_code=200)
-    
-    except HTTPException:
-        raise
+
     except Exception as e:
         print(f"[ERROR] analyze_ci failed: {str(e)}")
-        raise HTTPException(500, f"Analysis error: {str(e)}")
+        # ── FIX 1: Internal errors also return CRONOS format ──
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "FAIL",
+                "risk": 100,
+                "findings_count": 1,
+                "summary": [f"Analysis error: {str(e)}"],
+                "pass": False,
+                "warn": False,
+                "fail": True,
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
 
 
 @app.get("/report/json/{report_id}")
@@ -2080,6 +2128,7 @@ async def health():
             },
             "ci_cd": {
                 "analyze_ci": "POST /analyze_ci - Fast analysis for GitHub Actions",
+                "analyze_ci_info": "GET /analyze_ci - Usage info / health check",
                 "health": "GET / - Health check"
             }
         },
@@ -2135,12 +2184,14 @@ async def startup_event():
     print("  ✓ Professional PDF reports with risk breakdown")
     print("  ✓ CI/CD endpoint for GitHub Actions")
     print("  ✓ Dual CORS support (web UI + GitHub Actions)")
+    print("  ✓ Action-safe error responses (always CRONOS format)")
     print()
     print("🚀 ENDPOINTS:")
-    print("  • POST /analyze - Full analysis with AI")
-    print("  • POST /analyze_ci - CI/CD optimized endpoint")
-    print("  • GET /report/json/{id} - Download JSON")
-    print("  • GET /report/pdf/{id} - Download PDF")
+    print("  • POST /analyze     - Full analysis with AI")
+    print("  • POST /analyze_ci  - CI/CD optimized endpoint")
+    print("  • GET  /analyze_ci  - Usage info / health check")
+    print("  • GET  /report/json/{id} - Download JSON")
+    print("  • GET  /report/pdf/{id}  - Download PDF")
     print()
     print("🎓 READY FOR PRODUCTION & VIVA DEFENSE")
     print("=" * 80)
