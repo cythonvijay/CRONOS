@@ -1941,21 +1941,27 @@ async def analyze(req: AnalyzeRequest):
 # FIX 3: GET handler for /analyze_ci — DX polish for browser/health checks
 # ============================================================================
 
+# Replace the /analyze_ci endpoint in app.py with this corrected version
+
 @app.get("/analyze_ci")
 async def analyze_ci_get():
     """
     GET handler for /analyze_ci — returns usage info instead of 405.
     Useful for browser health checks and debugging.
     """
-    return {
-        "status": "OK",
-        "message": "POST-only endpoint. Send a JSON body with old_code, new_code, and mode.",
-        "example": {
-            "old_code": "x > 10",
-            "new_code": "x >= 10",
-            "mode": "STRICT"
-        }
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "OK",
+            "message": "POST-only endpoint. Send a JSON body with old_code, new_code, and mode.",
+            "example": {
+                "old_code": "x > 10",
+                "new_code": "x >= 10",
+                "mode": "STRICT"
+            }
+        },
+        headers={"Content-Type": "application/json"}
+    )
 
 
 @app.post("/analyze_ci")
@@ -1968,7 +1974,7 @@ async def analyze_ci(request: Request):
     Returns: {"risk": 60, "status": "FAIL", "findings": [...]}
     """
 
-    # ── FIX 1: Parse body — return CRONOS error if body is invalid/missing ──
+    # ── Parse body — return CRONOS error if invalid ──
     try:
         body = await request.json()
     except Exception:
@@ -1983,14 +1989,15 @@ async def analyze_ci(request: Request):
                 "warn": False,
                 "fail": True,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
+            },
+            headers={"Content-Type": "application/json"}
         )
 
     old_code = body.get("old_code", "")
     new_code = body.get("new_code", "")
     mode = str(body.get("mode", "STRICT")).upper()
 
-    # ── FIX 1: Validate new_code — return CRONOS error, not FastAPI detail ──
+    # ── Validate new_code — return CRONOS error ──
     if not new_code:
         return JSONResponse(
             status_code=400,
@@ -2003,7 +2010,8 @@ async def analyze_ci(request: Request):
                 "warn": False,
                 "fail": True,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
+            },
+            headers={"Content-Type": "application/json"}
         )
 
     # Validate / default mode
@@ -2045,8 +2053,11 @@ async def analyze_ci(request: Request):
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
 
-        print(f"[CI] Mode={mode}, Risk={risk}, Status={status}, Findings={len(findings)}")
-        print("FINAL RESPONSE:", response)
+        # Log for debugging (removed production prints)
+        # Optional: Use proper logging instead
+        # import logging
+        # logging.info(f"[CI] Mode={mode}, Risk={risk}, Status={status}")
+
         return JSONResponse(
             content=response,
             status_code=200,
@@ -2054,8 +2065,8 @@ async def analyze_ci(request: Request):
         )
 
     except Exception as e:
-        print(f"[ERROR] analyze_ci failed: {str(e)}")
-        # ── FIX 1: Internal errors also return CRONOS format ──
+        # Internal errors also return CRONOS format
+        # Removed debug print that exposes internals
         return JSONResponse(
             status_code=500,
             content={
@@ -2067,10 +2078,9 @@ async def analyze_ci(request: Request):
                 "warn": False,
                 "fail": True,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
-            }
+            },
+            headers={"Content-Type": "application/json"}
         )
-
-
 @app.get("/report/json/{report_id}")
 async def download_json(report_id: str):
     """Download analysis report as JSON"""
