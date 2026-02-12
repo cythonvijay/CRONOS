@@ -1,169 +1,31 @@
-name: CRONOS Code Analysis
+name: CRONOS Analysis
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ main, master, develop ]
+    branches: [ main, master ]
 
 jobs:
-  analyze:
-    name: Analyze Code Changes
+  cronos:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+          fetch-depth: 2  # Get current + previous commit for diff
+      
+      - name: Run CRONOS Analysis
+        uses: cythonvijay/cronos-action@v1
         with:
-          python-version: "3.11"
-
-      - name: Get changed Python files
-        id: changed-files
-        run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            git diff --name-only --diff-filter=AM \
-              ${{ github.event.pull_request.base.sha }} ${{ github.sha }} \
-              | grep '\.py$' > changed_files.txt || true
-          else
-            git diff --name-only --diff-filter=AM HEAD~1 HEAD \
-              | grep '\.py$' > changed_files.txt || true
-          fi
-
-          echo "Changed Python files:"
-          cat changed_files.txt || echo "(none)"
-
-          if [ -s changed_files.txt ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Analyze Python files
-        if: steps.changed-files.outputs.has_changes == 'true'
-        id: analysis
-        env:
-          CRONOS_API_URL: ${{ secrets.CRONOS_API_URL }}
-          ANALYSIS_MODE: STRICT
-        run: |
-          mkdir -p cronos-reports
-
-          echo "# 📊 CRONOS Analysis Report" > cronos-reports/summary.md
-          echo "**Mode:** $ANALYSIS_MODE" >> cronos-reports/summary.md
-          echo "**Commit:** ${{ github.sha }}" >> cronos-reports/summary.md
-          echo "" >> cronos-reports/summary.md
-
-          OVERALL_STATUS="PASS"
-          FAILED_FILES=0
-
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
-
-            echo "Analyzing: $file"
-
-            if [ "${{ github.event_name }}" == "pull_request" ]; then
-              git show ${{ github.event.pull_request.base.sha }}:"$file" \
-                > /tmp/old_code.py 2>/dev/null || echo "" > /tmp/old_code.py
-            else
-              git show HEAD~1:"$file" \
-                > /tmp/old_code.py 2>/dev/null || echo "" > /tmp/old_code.py
-            fi
-
-            cp "$file" /tmp/new_code.py
-
-            cat <<EOF > /tmp/payload.json
-{
-  "old_code": $(python3 - << 'EOF2'
-import json
-print(json.dumps(open('/tmp/old_code.py').read()))
-EOF2
-),
-  "new_code": $(python3 - << 'EOF2'
-import json
-print(json.dumps(open('/tmp/new_code.py').read()))
-EOF2
-),
-  "mode": "$ANALYSIS_MODE"
-}
-EOF
-
-            RESPONSE=$(curl -s -X POST "${CRONOS_API_URL}/analyze_ci" \
-              -H "Content-Type: application/json" \
-              --data-binary @/tmp/payload.json)
-
-            RISK=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys
-print(json.loads(sys.stdin.read()).get("risk", 0))
-EOF
-)
-            STATUS=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys
-print(json.loads(sys.stdin.read()).get("status", "UNKNOWN"))
-EOF
-)
-            SUMMARY=$(echo "$RESPONSE" | python3 - << 'EOF'
-import json, sys
-data=json.loads(sys.stdin.read())
-print("\n".join(data.get("summary", [])))
-EOF
-)
-
-            if [ "$STATUS" == "FAIL" ]; then
-              OVERALL_STATUS="FAIL"
-              FAILED_FILES=$((FAILED_FILES + 1))
-            elif [ "$STATUS" == "WARN" ] && [ "$OVERALL_STATUS" != "FAIL" ]; then
-              OVERALL_STATUS="WARN"
-            fi
-
-            {
-              echo "### 📄 \`$file\`"
-              echo "**Risk:** $RISK/100"
-              echo "**Status:** $STATUS"
-              echo '```'
-              echo "$SUMMARY"
-              echo '```'
-              echo "---"
-            } >> cronos-reports/summary.md
-
-            echo "$RESPONSE" > "cronos-reports/${file//\//_}_analysis.json"
-
-          done < changed_files.txt
-
-          echo "status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
-
-      - name: Upload analysis reports
-        if: steps.changed-files.outputs.has_changes == 'true'
+          api_url: ${{ secrets.CRONOS_API_URL }}
+          mode: STRICT  # Options: STRICT, BOUNDARY, CONTRACT
+      
+      - name: Upload Analysis Reports
         uses: actions/upload-artifact@v4
+        if: always()  # Upload even if analysis fails
         with:
-          name: cronos-analysis-reports
+          name: cronos-reports
           path: cronos-reports/
           retention-days: 30
-
-      - name: Comment PR
-        if: github.event_name == 'pull_request' && steps.changed-files.outputs.has_changes == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const summary = fs.readFileSync('cronos-reports/summary.md', 'utf8');
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: summary
-            });
-
-      - name: Fail workflow on high risk
-        if: steps.changed-files.outputs.has_changes == 'true'
-        run: |
-          if [ "${{ steps.analysis.outputs.status }}" == "FAIL" ]; then
-            echo "❌ CRONOS FAILED — blocking merge"
-            exit 1
-          else
-            echo "✅ CRONOS passed"
-          fi
