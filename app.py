@@ -1935,13 +1935,9 @@ async def analyze(req: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(500, f"Internal analysis error: {str(e)}")
 
-
 # ============================================================================
-# FIX 1: /analyze_ci — always return CRONOS-format JSON, never bare FastAPI errors
-# FIX 3: GET handler for /analyze_ci — DX polish for browser/health checks
+# REPLACE YOUR /analyze_ci ENDPOINTS WITH THESE (lines ~1450-1550 in app.py)
 # ============================================================================
-
-# Replace the /analyze_ci endpoint in app.py with this corrected version
 
 @app.get("/analyze_ci")
 async def analyze_ci_get():
@@ -1953,7 +1949,7 @@ async def analyze_ci_get():
         status_code=200,
         content={
             "status": "OK",
-            "message": "POST-only endpoint. Send a JSON body with old_code, new_code, and mode.",
+            "message": "POST-only endpoint. Send JSON body with old_code, new_code, mode.",
             "example": {
                 "old_code": "x > 10",
                 "new_code": "x >= 10",
@@ -1968,13 +1964,10 @@ async def analyze_ci_get():
 async def analyze_ci(request: Request):
     """
     CI/CD optimized endpoint for GitHub Actions.
-
-    Always returns CRONOS-format JSON — never bare FastAPI validation errors.
-    Accepts: {"old_code": "...", "new_code": "...", "mode": "STRICT"}
-    Returns: {"risk": 60, "status": "FAIL", "findings": [...]}
+    
+    Always returns CRONOS-format JSON.
     """
-
-    # ── Parse body — return CRONOS error if invalid ──
+    # Parse body
     try:
         body = await request.json()
     except Exception:
@@ -1997,7 +1990,7 @@ async def analyze_ci(request: Request):
     new_code = body.get("new_code", "")
     mode = str(body.get("mode", "STRICT")).upper()
 
-    # ── Validate new_code — return CRONOS error ──
+    # Validate new_code
     if not new_code:
         return JSONResponse(
             status_code=400,
@@ -2014,12 +2007,12 @@ async def analyze_ci(request: Request):
             headers={"Content-Type": "application/json"}
         )
 
-    # Validate / default mode
+    # Validate mode
     if mode not in ["STRICT", "BOUNDARY", "CONTRACT"]:
         mode = "STRICT"
 
     try:
-        # Build constraints based on mode
+        # Build constraints
         if mode == "STRICT":
             constraints = Constraint(no_behavior_change=True, allow_boundary_change=False)
         elif mode == "BOUNDARY":
@@ -2027,17 +2020,18 @@ async def analyze_ci(request: Request):
         else:  # CONTRACT
             constraints = Constraint(no_behavior_change=False, allow_boundary_change=False)
 
-        # Handle empty old_code (first commit — use COMPLIANCE mode)
+        # Choose analyzer based on old_code presence
         if not old_code.strip():
+            # First commit - use compliance analyzer
             analyzer = ComplianceAnalyzer()
             findings, raw_risk, metadata = analyzer.analyze(new_code, "")
         else:
+            # Normal commit - use change analyzer
             analyzer = ChangeAnalyzer()
             findings, raw_risk, metadata = analyzer.analyze(old_code, new_code, constraints)
 
         risk = normalize_risk(raw_risk)
         status = get_status(risk)
-
         summary = [f.findings[0] for f in findings[:5]] if findings else ["No issues detected"]
 
         response = {
@@ -2053,11 +2047,6 @@ async def analyze_ci(request: Request):
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
 
-        # Log for debugging (removed production prints)
-        # Optional: Use proper logging instead
-        # import logging
-        # logging.info(f"[CI] Mode={mode}, Risk={risk}, Status={status}")
-
         return JSONResponse(
             content=response,
             status_code=200,
@@ -2065,8 +2054,6 @@ async def analyze_ci(request: Request):
         )
 
     except Exception as e:
-        # Internal errors also return CRONOS format
-        # Removed debug print that exposes internals
         return JSONResponse(
             status_code=500,
             content={
