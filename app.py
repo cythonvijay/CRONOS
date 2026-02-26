@@ -878,119 +878,81 @@ class ExecutionPredictor:
 # ============================================================================
 # AI EXPLAINER
 # ============================================================================
+# ============================================================================
+# AI EXPLAINER (FIXED)
+# ============================================================================
+
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 def _call_gemini(prompt: str) -> Tuple[str, str]:
-    """Call Gemini via pure REST — no SDK, no grpcio, no Rust required."""
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not set")
+
     resp = requests.post(
-        f"{_GEMINI_URL}?key={GEMINI_API_KEY}",
+        _GEMINI_URL,
+        params={"key": GEMINI_API_KEY},
         headers={"Content-Type": "application/json"},
-        json={"contents": [{"parts": [{"text": prompt}]}],
-              "generationConfig": {"maxOutputTokens": 700, "temperature": 0.2}},
+        json={
+            "contents": [
+                {"parts": [{"text": prompt}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 700
+            }
+        },
         timeout=30,
     )
+
     resp.raise_for_status()
+
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
     return text.strip(), "Gemini"
 
+
 def _call_openrouter(prompt: str) -> Tuple[str, str]:
-    r = requests.post(
+
+    if not OPENROUTER_API_KEY:
+        raise Exception("OPENROUTER_API_KEY not set")
+
+    resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-        json={"model": "mistralai/mistral-7b-instruct", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 700},
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "deepseek/deepseek-chat",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 700
+        },
         timeout=30,
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"], "OpenRouter"
+
+    resp.raise_for_status()
+
+    return resp.json()["choices"][0]["message"]["content"], "OpenRouter"
+
 
 def _ai(prompt: str) -> Tuple[str, str]:
+
     if GEMINI_API_KEY:
-        try: return _call_gemini(prompt)
-        except Exception as e: print(f"⚠️ Gemini: {e}")
-    if OPENROUTER_ENABLED:
-        try: return _call_openrouter(prompt)
-        except Exception as e: print(f"⚠️ OpenRouter: {e}")
-    return "AI unavailable.", "None"
-
-class AIExplainer:
-    """Generates technical, human, and behavioral explanations."""
-
-    def explain(
-        self,
-        old_code: str, new_code: str,
-        findings: List, risk: int,
-        quality: int, security: int,
-        hashes: Dict, exec_pred: Dict,
-    ) -> Dict[str, str]:
-        pred_block = ""
-        if exec_pred.get("possible_outputs"):
-            pred_block = f"""
-Execution Prediction (confidence {exec_pred.get('confidence', 0)}):
-  Outputs   : {exec_pred.get('possible_outputs', [])[:5]}
-  Exceptions: {exec_pred.get('exceptions', [])[:3]}
-"""
-        prompt = f"""You are CRONOS v8 — enterprise static analysis engine. EXPLANATION ONLY.
-
-Context:
-  Risk Score    : {risk}/100
-  Quality Score : {quality}/100
-  Security Score: {security}/100
-  Findings      : {len(findings)}
-  Old Hash      : {hashes.get('old_hash','')[:24]}...
-  New Hash      : {hashes.get('new_hash','')[:24]}...
-  Semantic Hash : {hashes.get('semantic_hash','')[:24]}...
-{pred_block}
-OLD CODE:
-{old_code[:500]}
-
-NEW CODE:
-{new_code[:500]}
-
-Respond ONLY with this exact JSON (no markdown, no extra keys):
-{{
-  "technical_explanation": "2-3 sentences using AST/semantic analysis terminology",
-  "human_explanation": "2-3 sentences for a non-technical stakeholder",
-  "risk_reasoning": "1-2 sentences justifying the risk score",
-  "behavioral_impact": "1-2 sentences on runtime/user-facing impact"
-}}"""
         try:
-            raw, provider = _ai(prompt)
-            clean = raw.strip()
-            if clean.startswith("```"): clean = "\n".join(clean.split("\n")[1:])
-            if clean.endswith("```"):   clean = "\n".join(clean.split("\n")[:-1])
-            parsed = json.loads(clean.strip())
-            return {
-                "technical_explanation": str(parsed.get("technical_explanation", "")),
-                "human_explanation":     str(parsed.get("human_explanation", "")),
-                "risk_reasoning":        str(parsed.get("risk_reasoning", "")),
-                "behavioral_impact":     str(parsed.get("behavioral_impact", "")),
-                "ai_provider":           provider,
-            }
-        except Exception:
-            return {
-                "technical_explanation": "Analysis complete. Review findings.",
-                "human_explanation":     "Analysis complete. Review findings.",
-                "risk_reasoning":        "",
-                "behavioral_impact":     "",
-                "ai_provider":           "None",
-            }
+            return _call_gemini(prompt)
+        except Exception as e:
+            print(f"⚠️ Gemini failed: {e}")
 
-    def realtime_explain(self, code: str, findings: List, risk: int, security: int) -> Dict[str, str]:
-        prompt = f"""You are CRONOS v8. Analyze this code fragment quickly.
-Risk: {risk}/100, Security: {security}/100, Issues: {len(findings)}
-CODE: {code[:400]}
-Return ONLY JSON:
-{{"technical_explanation":"...","human_explanation":"...","risk_reasoning":"...","behavioral_impact":"..."}}"""
+    if OPENROUTER_API_KEY:
         try:
-            raw, provider = _ai(prompt)
-            clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
-            parsed = json.loads(clean)
-            return {**{k: str(parsed.get(k,"")) for k in ("technical_explanation","human_explanation","risk_reasoning","behavioral_impact")}, "ai_provider": provider}
-        except:
-            return {"technical_explanation":"","human_explanation":"","risk_reasoning":"","behavioral_impact":"","ai_provider":"None"}
+            return _call_openrouter(prompt)
+        except Exception as e:
+            print(f"⚠️ OpenRouter failed: {e}")
 
-
+    raise Exception("No AI provider available")
 # ============================================================================
 # PR COMMENT FORMATTER (Feature 1)
 # ============================================================================
