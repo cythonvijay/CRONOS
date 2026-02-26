@@ -24,22 +24,23 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
-import google.generativeai as genai
-
 # ============================================================================
 # API KEYS
+# NOTE: google-generativeai SDK intentionally removed.
+# It depends on grpcio, which on Python 3.13 has no pre-built wheel and
+# triggers maturin/Rust compilation — failing on Render's read-only filesystem.
+# Gemini is called via the pure REST API using `requests` (already a dep).
 # ============================================================================
 
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-else:
-    gemini_model = None
-
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
+
+# Gemini REST endpoint — no SDK, no Rust, no maturin, no compilation needed
+_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+    "/gemini-1.5-flash:generateContent"
+)
 
 # ============================================================================
 # APP SETUP
@@ -879,8 +880,19 @@ class ExecutionPredictor:
 # ============================================================================
 
 def _call_gemini(prompt: str) -> Tuple[str, str]:
-    if not gemini_model: raise Exception("Gemini not configured")
-    return gemini_model.generate_content(prompt).text.strip(), "Gemini"
+    """Call Gemini via pure REST — no SDK, no grpcio, no Rust required."""
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY not set")
+    resp = requests.post(
+        f"{_GEMINI_URL}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json={"contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"maxOutputTokens": 700, "temperature": 0.2}},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    return text.strip(), "Gemini"
 
 def _call_openrouter(prompt: str) -> Tuple[str, str]:
     r = requests.post(
@@ -893,7 +905,7 @@ def _call_openrouter(prompt: str) -> Tuple[str, str]:
     return r.json()["choices"][0]["message"]["content"], "OpenRouter"
 
 def _ai(prompt: str) -> Tuple[str, str]:
-    if gemini_model:
+    if GEMINI_API_KEY:
         try: return _call_gemini(prompt)
         except Exception as e: print(f"⚠️ Gemini: {e}")
     if OPENROUTER_ENABLED:
@@ -1759,7 +1771,7 @@ async def health():
             "hashes_only": True,
         },
         "intelligence": {
-            "gemini":     gemini_model is not None,
+            "gemini":     bool(GEMINI_API_KEY),
             "openrouter": OPENROUTER_ENABLED,
             "layers": ["IntelligenceEngine", "CodeQualityAnalyzer", "SecurityAnalyzer",
                        "ExecutionPredictor", "AIExplainer", "RiskEngine"],
@@ -1774,7 +1786,7 @@ async def startup():
     print("=" * 80)
     print("✅ CRONOS v8.0.0 — ENTERPRISE INTELLIGENCE CODE ANALYZER")
     print("=" * 80)
-    print(f"🤖 Gemini    : {'✅ Enabled' if gemini_model else '❌ Disabled'}")
+    print(f"🤖 Gemini    : {'✅ Enabled' if GEMINI_API_KEY else '❌ Disabled'}")
     print(f"🤖 OpenRouter: {'✅ Enabled' if OPENROUTER_ENABLED else '❌ Disabled'}")
     print(f"🗄️  Database  : {DB_PATH}")
     print()
