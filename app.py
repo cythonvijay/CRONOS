@@ -34,10 +34,7 @@ GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
 
-_GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-    "/gemini-1.5-flash:generateContent"
-)
+_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 # ============================================================================
 # APP SETUP
@@ -860,19 +857,37 @@ class ExecutionPredictor:
 def _call_gemini(prompt: str) -> Tuple[str, str]:
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not set")
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 700
+        }
+    }
+
     resp = requests.post(
-        _GEMINI_URL,
-        params={"key": GEMINI_API_KEY},
+        f"{_GEMINI_URL}?key={GEMINI_API_KEY}",
         headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 700}
-        },
+        json=payload,
         timeout=30,
     )
-    resp.raise_for_status()
-    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return text.strip(), "Gemini"
+
+    if resp.status_code != 200:
+        raise Exception(f"Gemini error {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+
+    return (
+        data["candidates"][0]["content"]["parts"][0]["text"],
+        "Gemini"
+    )
 
 
 def _call_openrouter(prompt: str) -> Tuple[str, str]:
