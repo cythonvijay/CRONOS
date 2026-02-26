@@ -980,10 +980,10 @@ Do not include markdown, code blocks, or extra keys."""
             raw, provider = _ai(prompt)
             parsed = self._parse_json(raw)
             return {
-                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, mode)),
-                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, mode)),
-                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, quality_score, security_score)),
-                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
+                "technical_explanation": parsed.get("technical_explanation") or self._fallback_tech(risk_score, findings_text, mode),
+                "human_explanation":     parsed.get("human_explanation")     or self._fallback_human(risk_score, mode),
+                "risk_reasoning":        parsed.get("risk_reasoning")        or self._fallback_reason(risk_score, quality_score, security_score),
+                "behavioral_impact":     parsed.get("behavioral_impact")     or self._fallback_impact(findings_text),
                 "ai_provider":           provider,
             }
         except Exception as e:
@@ -1022,10 +1022,10 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
             raw, provider = _ai(prompt)
             parsed = self._parse_json(raw)
             return {
-                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, "REALTIME")),
-                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, "REALTIME")),
-                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, 100, security_score)),
-                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
+                "technical_explanation": parsed.get("technical_explanation") or self._fallback_tech(risk_score, findings_text, "REALTIME"),
+                "human_explanation":     parsed.get("human_explanation")     or self._fallback_human(risk_score, "REALTIME"),
+                "risk_reasoning":        parsed.get("risk_reasoning")        or self._fallback_reason(risk_score, 100, security_score),
+                "behavioral_impact":     parsed.get("behavioral_impact")     or self._fallback_impact(findings_text),
                 "ai_provider":           provider,
             }
         except Exception as e:
@@ -1033,7 +1033,10 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
             return self._safe_defaults(risk_score, 100, security_score, findings_text, "REALTIME")
 
     def _parse_json(self, raw: str) -> Dict:
-        """Parse AI JSON response robustly — strips markdown fences."""
+        """Parse AI JSON response robustly — strips markdown fences.
+        Returns {} if parsing fails OR if all 4 required keys are empty strings,
+        so that callers using `or` fall through to deterministic fallbacks.
+        """
         if not raw:
             return {}
         text = raw.strip()
@@ -1041,17 +1044,27 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
         text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
         text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
         text = text.strip()
+
+        parsed = {}
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             # Attempt to extract first {...} block
             m = re.search(r'\{.*\}', text, re.DOTALL)
             if m:
                 try:
-                    return json.loads(m.group(0))
+                    parsed = json.loads(m.group(0))
                 except:
                     pass
-        return {}
+
+        # If Gemini returned the JSON skeleton with empty values, discard it
+        # so the `or fallback()` pattern in callers activates correctly.
+        REQUIRED = ("technical_explanation", "human_explanation", "risk_reasoning", "behavioral_impact")
+        if parsed and all(not parsed.get(k, "").strip() for k in REQUIRED):
+            print("⚠️ AI returned empty-valued JSON — using deterministic fallbacks")
+            return {}
+
+        return parsed
 
     # ── Fallback strings (no AI required) ────────────────────────────────────
     def _fallback_tech(self, risk: int, findings: str, mode: str) -> str:
@@ -1479,10 +1492,10 @@ async def run_full_analysis(
         "new_hash":      new_hash,
         "semantic_hash": semantic_hash,
         # Full AI explanations always present
-        "technical_explanation": ai_fields.get("technical_explanation", ""),
-        "human_explanation":     ai_fields.get("human_explanation", ""),
-        "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
-        "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
+        "technical_explanation": ai_fields.get("technical_explanation") or _ai_ex._fallback_tech(risk_score, "; ".join(f.findings[0] for f in risk_findings[:3]) if risk_findings else "No findings", mode),
+        "human_explanation":     ai_fields.get("human_explanation")     or _ai_ex._fallback_human(risk_score, mode),
+        "risk_reasoning":        ai_fields.get("risk_reasoning")        or _ai_ex._fallback_reason(risk_score, quality_score, security_score),
+        "behavioral_impact":     ai_fields.get("behavioral_impact")     or _ai_ex._fallback_impact("; ".join(f.findings[0] for f in risk_findings[:3]) if risk_findings else "No findings"),
         "ai_provider":           ai_fields.get("ai_provider", "None"),
         # Execution prediction
         "execution_prediction": {
