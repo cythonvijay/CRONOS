@@ -1,9 +1,12 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-requests==2.31.0
-urllib3==2.2.1
-charset-normalizer==3.3.2
+# CRONOS v8 — Render-compatible requirements
+# google-generativeai intentionally excluded: pulls grpcio which requires
+# Rust (maturin) compilation and fails on Render's read-only filesystem.
+# Gemini is called via pure HTTP REST using the requests library below.
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
 python-dotenv==1.0.1
-reportlab==4.1.0
-google-generativeai==0.5.4
-pydantic==2.6.4
+requests==2.32.3
+reportlab==4.2.5
+python-multipart==0.0.12
