@@ -7,11 +7,13 @@ import json
 import ast
 import hashlib
 import uuid
+import asyncio
 import requests
 from datetime import datetime
 from typing import List, Dict, Any, Set, Tuple, Optional
 from io import BytesIO
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,8 +48,8 @@ OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
 
 app = FastAPI(
     title="CRONOS – Advanced Intelligence Code Analyzer",
-    version="6.0.0",
-    description="Production-grade Python static analysis: SonarQube + Security + Execution Prediction"
+    version="7.0.0",
+    description="Enterprise-grade Python static analysis: SonarQube + AI Semantic Reasoning + Execution Prediction"
 )
 
 app.add_middleware(
@@ -72,6 +74,16 @@ app.add_middleware(
 
 REPORT_DIR = "reports"
 os.makedirs(REPORT_DIR, exist_ok=True)
+
+# In-memory store for instant report retrieval (report_id → result dict)
+REPORT_STORE: Dict[str, Any] = {}
+
+# Hash cache: semantic_hash → full analysis result
+# Avoids re-analysing identical AST structure
+HASH_CACHE: Dict[str, Any] = {}
+
+# Thread pool for running sync analyzers inside async endpoints
+_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -132,6 +144,33 @@ class FullAnalyzeRequest(BaseModel):
         if v.upper() not in ['STRICT', 'BOUNDARY', 'CONTRACT']:
             return 'STRICT'
         return v.upper()
+
+# ---------------------------------------------------------------------------
+# Hash utility — three hashes used throughout v7
+# ---------------------------------------------------------------------------
+
+def compute_hashes(old_code: str, new_code: str) -> Dict[str, str]:
+    """
+    Generate:
+      old_hash     = SHA256(old_code)
+      new_hash     = SHA256(new_code)
+      semantic_hash = SHA256(AST-dump of new_code)  — structure-only, ignores whitespace/comments
+    """
+    old_hash = hashlib.sha256(old_code.encode('utf-8')).hexdigest() if old_code.strip() else ""
+    new_hash = hashlib.sha256(new_code.encode('utf-8')).hexdigest()
+
+    try:
+        tree = ast.parse(new_code)
+        ast_repr = ast.dump(tree, indent=None)
+        semantic_hash = hashlib.sha256(ast_repr.encode('utf-8')).hexdigest()
+    except Exception:
+        semantic_hash = new_hash  # fallback: same as content hash
+
+    return {
+        "old_hash": old_hash,
+        "new_hash": new_hash,
+        "semantic_hash": semantic_hash,
+    }
 
 # ============================================================================
 # AST UTILITIES
@@ -571,8 +610,13 @@ class ExecutionPredictor:
             return {
                 "possible_outputs": ["Parse error — prediction unavailable"],
                 "return_values": [],
+                "print_outputs": [],
                 "branches": [],
+                "state_changes": [],
+                "exceptions": [],
+                "auth_outcomes": [],
                 "confidence": 0.0,
+                "execution_paths": 1,
                 "error": str(e)
             }
 
@@ -581,12 +625,16 @@ class ExecutionPredictor:
         branches = []
         print_outputs = []
         auth_outcomes = []
+        state_changes = []
+        exceptions = []
 
         # Walk AST and extract predictions
         self._extract_returns(tree, return_values)
         self._extract_prints(tree, print_outputs)
         self._extract_branches(tree, branches)
         self._extract_auth_logic(tree, auth_outcomes)
+        self._extract_state_changes(tree, state_changes)
+        self._extract_exceptions(tree, exceptions)
 
         possible_outputs.extend(return_values[:5])
         possible_outputs.extend(print_outputs[:3])
@@ -602,10 +650,12 @@ class ExecutionPredictor:
         confidence = round(confidence, 2)
 
         return {
-            "possible_outputs": list(dict.fromkeys(possible_outputs)),  # deduplicate
+            "possible_outputs": list(dict.fromkeys(possible_outputs)),
             "return_values": return_values[:8],
             "print_outputs": print_outputs[:5],
             "branches": branches[:8],
+            "state_changes": state_changes[:6],
+            "exceptions": exceptions[:5],
             "auth_outcomes": auth_outcomes,
             "confidence": confidence,
             "execution_paths": len(branches) + 1
@@ -684,15 +734,57 @@ class ExecutionPredictor:
                 try:
                     cond = ast.unparse(node.test).lower()
                     if any(kw in cond for kw in auth_keywords):
-                        # Extract what happens in true branch
                         for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
                             if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant):
                                 results.append(f'Auth path (if {cond[:40]}): returns {repr(child.value.value)}')
-                        # Extract false branch
                         if node.orelse:
                             for child in ast.walk(ast.Module(body=node.orelse, type_ignores=[])):
                                 if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant):
                                     results.append(f'Auth fallback: returns {repr(child.value.value)}')
+                except Exception:
+                    pass
+
+    def _extract_state_changes(self, tree: ast.AST, results: List):
+        """Detect assignments that mutate state (counters, flags, lists)."""
+        for node in ast.walk(tree):
+            # AugAssign: x += 1, x -= 1, attempts += 1
+            if isinstance(node, ast.AugAssign):
+                try:
+                    target = ast.unparse(node.target)
+                    op = type(node.op).__name__
+                    val = ast.unparse(node.value)
+                    results.append(f'State mutation: {target} {op}= {val}')
+                except Exception:
+                    pass
+            # Regular assign with numeric literal (flag/counter reset)
+            elif isinstance(node, ast.Assign):
+                try:
+                    for t in node.targets:
+                        if isinstance(t, ast.Name) and isinstance(node.value, ast.Constant):
+                            v = node.value.value
+                            if isinstance(v, (int, float, bool)):
+                                results.append(f'State set: {t.id} = {v}')
+                except Exception:
+                    pass
+
+    def _extract_exceptions(self, tree: ast.AST, results: List):
+        """Detect raise statements and risky patterns."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise):
+                try:
+                    if node.exc is not None:
+                        results.append(f'Raises: {ast.unparse(node.exc)[:60]}')
+                    else:
+                        results.append('Re-raises current exception')
+                except Exception:
+                    pass
+            # Detect division — potential ZeroDivisionError
+            elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                try:
+                    if isinstance(node.right, ast.Constant) and node.right.value == 0:
+                        results.append('Risk: division by zero constant detected')
+                    else:
+                        results.append(f'Potential ZeroDivisionError: {ast.unparse(node)[:50]}')
                 except Exception:
                     pass
 
@@ -1325,33 +1417,90 @@ def compliance_solution_prompt(hash_code: str, expected: str, risk: int) -> str:
     return f"""You are a software architect. Code Hash: {hash_code}, Expected: {expected}, Risk: {risk}
 What should be verified, tested, and changed? Keep high-level and actionable. Under 120 words."""
 
-def semantic_explanation_prompt(old_code: str, new_code: str, findings: List, risk: int, quality_score: int, security_score: int) -> str:
-    return f"""You are CRONOS, an advanced code intelligence engine. Provide a comprehensive semantic explanation.
+def semantic_explanation_prompt(old_code: str, new_code: str, findings: List, risk: int,
+                                quality_score: int, security_score: int,
+                                hashes: Optional[Dict] = None,
+                                execution_prediction: Optional[Dict] = None) -> str:
+    """
+    v7 enriched prompt — passes all structured context so AI can give
+    technical_explanation, human_explanation, risk_reasoning, behavioral_impact.
+    AI must NOT influence risk score.
+    """
+    hash_block = ""
+    if hashes:
+        hash_block = f"""
+Code Integrity Hashes:
+  old_hash      : {hashes.get('old_hash', 'N/A')[:24]}...
+  new_hash      : {hashes.get('new_hash', 'N/A')[:24]}...
+  semantic_hash : {hashes.get('semantic_hash', 'N/A')[:24]}...
+"""
 
-Code Change Summary:
-- Risk Score: {risk}/100
-- Quality Score: {quality_score}/100  
-- Security Score: {security_score}/100
-- Findings Count: {len(findings)}
+    pred_block = ""
+    if execution_prediction and execution_prediction.get("possible_outputs"):
+        outs = execution_prediction.get("possible_outputs", [])[:5]
+        exc  = execution_prediction.get("exceptions", [])[:3]
+        conf = execution_prediction.get("confidence", 0)
+        pred_block = f"""
+Execution Prediction (AST-simulated, confidence {conf}):
+  Possible outputs : {outs}
+  Exception risks  : {exc}
+"""
 
+    return f"""You are CRONOS v7 — an enterprise static analysis intelligence engine.
+Your role is EXPLANATION ONLY. You must NOT change or influence any numeric score.
+
+STRUCTURED CONTEXT:
+══════════════════════════════════════════════
+Risk Score    : {risk}/100
+Quality Score : {quality_score}/100
+Security Score: {security_score}/100
+Findings Count: {len(findings)}
+{hash_block}{pred_block}
 OLD CODE:
-{old_code[:500]}
+{old_code[:600]}
 
 NEW CODE:
-{new_code[:500]}
+{new_code[:600]}
+══════════════════════════════════════════════
 
-Provide:
-1. What semantically changed
-2. Security implications
-3. Quality impact
-4. Overall recommendation (APPROVE / REVIEW / REJECT)
+Respond with EXACTLY this JSON structure (no markdown, no extra keys):
+{{
+  "technical_explanation": "2-3 sentences using AST/semantic analysis terminology",
+  "human_explanation": "2-3 sentences for a non-technical stakeholder, no jargon",
+  "risk_reasoning": "1-2 sentences justifying the risk score",
+  "behavioral_impact": "1-2 sentences on runtime/user-facing impact"
+}}"""
 
-Keep under 200 words. Be precise and actionable."""
+
+def parse_ai_explanation(raw: str) -> Dict[str, str]:
+    """
+    Parse the structured JSON the AI is asked to return.
+    Falls back to putting the whole response in technical_explanation.
+    """
+    try:
+        # Strip markdown fences if present
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = "\n".join(clean.split("\n")[1:])
+        if clean.endswith("```"):
+            clean = "\n".join(clean.split("\n")[:-1])
+        parsed = json.loads(clean.strip())
+        return {
+            "technical_explanation": str(parsed.get("technical_explanation", "")),
+            "human_explanation":     str(parsed.get("human_explanation", "")),
+            "risk_reasoning":        str(parsed.get("risk_reasoning", "")),
+            "behavioral_impact":     str(parsed.get("behavioral_impact", "")),
+        }
+    except Exception:
+        return {
+            "technical_explanation": raw[:500],
+            "human_explanation":     "Analysis completed. Please review technical findings.",
+            "risk_reasoning":        "",
+            "behavioral_impact":     "",
+        }
 
 
-# ============================================================================
-# FULL ANALYSIS RUNNER
-# ============================================================================
+
 
 def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") -> Dict[str, Any]:
     """
