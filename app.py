@@ -27,16 +27,13 @@ from reportlab.pdfgen import canvas
 # ============================================================================
 # API KEYS
 # NOTE: google-generativeai SDK intentionally removed.
-# It depends on grpcio, which on Python 3.13 has no pre-built wheel and
-# triggers maturin/Rust compilation — failing on Render's read-only filesystem.
-# Gemini is called via the pure REST API using `requests` (already a dep).
+# Gemini is called via the pure REST API using `requests`.
 # ============================================================================
 
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
 
-# Gemini REST endpoint — no SDK, no Rust, no maturin, no compilation needed
 _GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models"
     "/gemini-1.5-flash:generateContent"
@@ -74,12 +71,7 @@ HASH_CACHE:   Dict[str, Any] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
 # ============================================================================
-# ██████╗  █████╗ ████████╗ █████╗ ██████╗  █████╗ ███████╗███████╗
-# ██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝
-# ██║  ██║███████║   ██║   ███████║██████╔╝███████║███████╗█████╗
-# ██║  ██║██╔══██║   ██║   ██╔══██║██╔══██╗██╔══██║╚════██║██╔══╝
-# ██████╔╝██║  ██║   ██║   ██║  ██║██████╔╝██║  ██║███████║███████╗
-# ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝
+# DATABASE
 # ============================================================================
 
 DB_PATH = os.getenv("CRONOS_DB_PATH", "cronos.db")
@@ -147,26 +139,22 @@ class AnalyzeRequest(BaseModel):
 
 class FullAnalyzeRequest(BaseModel):
     old_code: str = Field(default="")
-    new_code: str = Field(...)
+    new_code: str = Field(default="")
     mode:     str = Field(default="STRICT")
     repo:     str = Field(default="")
     file:     str = Field(default="")
 
     @validator('mode')
     def validate_mode(cls, v):
-        return v.upper() if v.upper() in ['STRICT', 'BOUNDARY', 'CONTRACT'] else 'STRICT'
+        allowed = ['STRICT', 'BOUNDARY', 'CONTRACT']
+        return v.upper() if v.upper() in allowed else 'STRICT'
 
 class RealtimeAnalyzeRequest(BaseModel):
     code:     str = Field(...)
     filename: str = Field(default="unknown.py")
 
 # ============================================================================
-# ██╗  ██╗ █████╗ ███████╗██╗  ██╗    ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗
-# ██║  ██║██╔══██╗██╔════╝██║  ██║    ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██╔════╝
-# ███████║███████║███████╗███████║    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗
-# ██╔══██║██╔══██║╚════██║██╔══██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝
-# ██║  ██║██║  ██║███████║██║  ██║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗
-# ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
+# HASH ENGINE
 # ============================================================================
 
 class HashEngine:
@@ -191,7 +179,6 @@ class HashEngine:
             "new_hash":      HashEngine.sha256(new_code),
             "semantic_hash": HashEngine.semantic(new_code),
         }
-
 
 # ============================================================================
 # SEVERITY ENGINE
@@ -259,7 +246,6 @@ class RiskEngine:
             behavior * 0.15
         )))
 
-
 # ============================================================================
 # AST UTILITIES
 # ============================================================================
@@ -300,7 +286,6 @@ def _cf_sig(tree: ast.AST) -> Dict[str, int]:
         t = type(n).__name__.lower()
         if t in sig: sig[t] += 1
     return sig
-
 
 # ============================================================================
 # INTELLIGENCE ENGINE
@@ -395,17 +380,14 @@ class IntelligenceEngine:
         except:
             return {"changed": True, "summary": "Parse error", "changes": [], "behavior_score": 50}
         changes = []; score = 100
-        # Returns
         or_ = self._returns(oa); nr_ = self._returns(na)
         if or_ != nr_:
-            changes.append({"category": "ReturnValue", "description": f"Returns changed", "impact": "high"})
+            changes.append({"category": "ReturnValue", "description": "Returns changed", "impact": "high"})
             score -= 20
-        # Conditions
         oc = self._conds(oa); nc = self._conds(na)
         if set(oc) != set(nc):
             changes.append({"category": "ControlFlow", "description": "Conditions changed", "impact": "high"})
             score -= 15
-        # Signatures
         os_ = self._sigs(oa); ns_ = self._sigs(na)
         for fn in set(os_) & set(ns_):
             if os_[fn] != ns_[fn]:
@@ -418,7 +400,7 @@ class IntelligenceEngine:
             "behavior_score": max(0, score),
         }
 
-    # ── Node type extraction ─────────────────────────────────────────────────
+    # ── Node type extraction ──────────────────────────────────────────────────
     def _nodes(self, tree: ast.AST) -> Dict:
         n = {
             'compare_ops': [], 'bool_ops': [], 'functions': [], 'calls': [],
@@ -523,7 +505,7 @@ class IntelligenceEngine:
                 f.append(AnalyzerResult(name="ConditionShift", findings=[f"'{fn}' signature changed"], risk=65)); r = max(r, 65)
         oc = set(on['calls']); nc = set(nn['calls'])
         if oc != nc:
-            f.append(AnalyzerResult(name="ConditionShift", findings=[f"Call patterns changed"], risk=60)); r = max(r, 60)
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Call patterns changed"], risk=60)); r = max(r, 60)
         return r, f, d
 
     def _loops(self, on, nn):
@@ -579,7 +561,6 @@ class IntelligenceEngine:
         elif ast.dump(oa) != ast.dump(na):
             f.append(AnalyzerResult(name="ConditionShift", findings=["Cosmetic changes"], risk=5)); r = 5
         return r, f, d
-
 
 # ============================================================================
 # CODE QUALITY ANALYZER
@@ -672,23 +653,22 @@ class CodeQualityAnalyzer:
                 issues.append({"type": "DuplicateLogic", "message": f"'{cond[:60]}' appears {len(lines)}x", "severity": "low"})
         return issues
 
-
 # ============================================================================
 # SECURITY ANALYZER
 # ============================================================================
 
 class SecurityAnalyzer:
     DANGEROUS_CALLS = {
-        'eval':     ('critical', 'eval() — RCE risk', 'CWE-78'),
-        'exec':     ('critical', 'exec() — RCE risk', 'CWE-78'),
-        'compile':  ('high',     'compile() — arbitrary code', 'CWE-94'),
-        '__import__': ('high',   'Dynamic import', 'CWE-94'),
+        'eval':       ('critical', 'eval() — RCE risk',          'CWE-78'),
+        'exec':       ('critical', 'exec() — RCE risk',          'CWE-78'),
+        'compile':    ('high',     'compile() — arbitrary code', 'CWE-94'),
+        '__import__': ('high',     'Dynamic import',             'CWE-94'),
     }
     DANGEROUS_ATTRS = {
-        'loads': ('critical', 'pickle.loads() — deserialization RCE', 'CWE-502'),
-        'load':  ('high',     'pickle.load() — untrusted data', 'CWE-502'),
-        'system': ('high',    'os.system() — shell injection', 'CWE-78'),
-        'Popen':  ('high',    'subprocess.Popen() — injection risk', 'CWE-78'),
+        'loads':  ('critical', 'pickle.loads() — deserialization RCE', 'CWE-502'),
+        'load':   ('high',     'pickle.load() — untrusted data',       'CWE-502'),
+        'system': ('high',     'os.system() — shell injection',        'CWE-78'),
+        'Popen':  ('high',     'subprocess.Popen() — injection risk',  'CWE-78'),
     }
     WEAK_HASH    = {'md5', 'sha1'}
     INSECURE_RNG = {'random', 'randint', 'choice', 'shuffle', 'seed'}
@@ -774,7 +754,6 @@ class SecurityAnalyzer:
             for m in pat.findall(code)[:2]:
                 f.append({"type": "HardcodedSecret", "message": f"Credential: '{m[:50]}...' — use env vars", "severity": "critical", "cwe": "CWE-798"})
         return f
-
 
 # ============================================================================
 # EXECUTION PREDICTOR
@@ -874,48 +853,31 @@ class ExecutionPredictor:
                         r.append(f'Potential ZeroDivisionError: {ast.unparse(n)[:50]}')
                 except: pass
 
-
 # ============================================================================
 # AI EXPLAINER
 # ============================================================================
-# ============================================================================
-# AI EXPLAINER (FIXED)
-# ============================================================================
-
-_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
 def _call_gemini(prompt: str) -> Tuple[str, str]:
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not set")
-
     resp = requests.post(
         _GEMINI_URL,
         params={"key": GEMINI_API_KEY},
         headers={"Content-Type": "application/json"},
         json={
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 700
-            }
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 700}
         },
         timeout=30,
     )
-
     resp.raise_for_status()
-
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-
     return text.strip(), "Gemini"
 
 
 def _call_openrouter(prompt: str) -> Tuple[str, str]:
-
     if not OPENROUTER_API_KEY:
         raise Exception("OPENROUTER_API_KEY not set")
-
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -924,37 +886,203 @@ def _call_openrouter(prompt: str) -> Tuple[str, str]:
         },
         json={
             "model": "deepseek/deepseek-chat",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 700
         },
         timeout=30,
     )
-
     resp.raise_for_status()
-
     return resp.json()["choices"][0]["message"]["content"], "OpenRouter"
 
 
 def _ai(prompt: str) -> Tuple[str, str]:
-
+    """Call AI provider with fallback. Never raises — returns empty string on total failure."""
     if GEMINI_API_KEY:
         try:
             return _call_gemini(prompt)
         except Exception as e:
             print(f"⚠️ Gemini failed: {e}")
-
     if OPENROUTER_API_KEY:
         try:
             return _call_openrouter(prompt)
         except Exception as e:
             print(f"⚠️ OpenRouter failed: {e}")
+    return "", "None"
 
-    raise Exception("No AI provider available")
+
+class AIExplainer:
+    """Generates structured AI explanations for code analysis results."""
+
+    def explain(
+        self,
+        old_code: str,
+        new_code: str,
+        findings: List[AnalyzerResult],
+        risk_score: int,
+        quality_score: int,
+        security_score: int,
+        hashes: Dict[str, str],
+        exec_summary: Dict[str, Any],
+        mode: str = "STRICT",
+    ) -> Dict[str, Any]:
+        """
+        Generate 4-field AI explanation. Never raises — returns safe defaults on failure.
+        """
+        findings_text = "; ".join(
+            f.findings[0] for f in findings[:5]
+        ) if findings else "No specific findings"
+
+        exec_outputs = exec_summary.get("possible_outputs", [])
+        exec_exceptions = exec_summary.get("exceptions", [])
+        exec_confidence = exec_summary.get("confidence", 0)
+
+        prompt = f"""You are CRONOS, an enterprise code intelligence engine.
+
+Mode: {mode}
+Risk Score: {risk_score}/100
+Quality Score: {quality_score}/100
+Security Score: {security_score}/100
+Findings: {findings_text}
+Execution Outputs: {exec_outputs[:3]}
+Exception Risks: {exec_exceptions[:3]}
+Execution Confidence: {exec_confidence}
+Old Code Hash: {hashes.get('old_hash', 'N/A')}
+New Code Hash: {hashes.get('new_hash', 'N/A')}
+
+Respond ONLY as a JSON object with exactly these 4 keys:
+{{
+  "technical_explanation": "...",
+  "human_explanation": "...",
+  "risk_reasoning": "...",
+  "behavioral_impact": "..."
+}}
+
+Each value must be a single string of 2-4 sentences.
+Do not include markdown, code blocks, or extra keys."""
+
+        try:
+            raw, provider = _ai(prompt)
+            parsed = self._parse_json(raw)
+            return {
+                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, mode)),
+                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, mode)),
+                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, quality_score, security_score)),
+                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
+                "ai_provider":           provider,
+            }
+        except Exception as e:
+            print(f"⚠️ AIExplainer.explain failed: {e}")
+            return self._safe_defaults(risk_score, quality_score, security_score, findings_text, mode)
+
+    def realtime_explain(
+        self,
+        code: str,
+        security_findings: List[Dict],
+        risk_score: int,
+        security_score: int,
+    ) -> Dict[str, Any]:
+        """Lightweight realtime explanation for IDE plugin. Never raises."""
+        findings_text = "; ".join(
+            f.get("message", "") for f in security_findings[:3]
+        ) if security_findings else "No security findings"
+
+        prompt = f"""You are CRONOS realtime code intelligence.
+
+Risk Score: {risk_score}/100
+Security Score: {security_score}/100
+Security Findings: {findings_text}
+
+Respond ONLY as a JSON object:
+{{
+  "technical_explanation": "...",
+  "human_explanation": "...",
+  "risk_reasoning": "...",
+  "behavioral_impact": "..."
+}}
+
+Each value: 1-2 sentences. No markdown, no extra keys."""
+
+        try:
+            raw, provider = _ai(prompt)
+            parsed = self._parse_json(raw)
+            return {
+                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, "REALTIME")),
+                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, "REALTIME")),
+                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, 100, security_score)),
+                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
+                "ai_provider":           provider,
+            }
+        except Exception as e:
+            print(f"⚠️ AIExplainer.realtime_explain failed: {e}")
+            return self._safe_defaults(risk_score, 100, security_score, findings_text, "REALTIME")
+
+    def _parse_json(self, raw: str) -> Dict:
+        """Parse AI JSON response robustly — strips markdown fences."""
+        if not raw:
+            return {}
+        text = raw.strip()
+        # Strip markdown code fences
+        text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Attempt to extract first {...} block
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except:
+                    pass
+        return {}
+
+    # ── Fallback strings (no AI required) ────────────────────────────────────
+    def _fallback_tech(self, risk: int, findings: str, mode: str) -> str:
+        return (
+            f"[{mode}] CRONOS AST analysis detected risk score {risk}/100. "
+            f"Key findings: {findings[:200]}. "
+            "Static analysis completed using IntelligenceEngine, SecurityAnalyzer, and CodeQualityAnalyzer."
+        )
+
+    def _fallback_human(self, risk: int, mode: str) -> str:
+        if risk >= 80:
+            return f"[{mode}] This change is HIGH RISK and should not be merged without a full review. Critical issues were detected that may break functionality or introduce security vulnerabilities."
+        if risk >= 60:
+            return f"[{mode}] This change carries significant risk. Review all findings carefully before merging."
+        if risk >= 40:
+            return f"[{mode}] This change has moderate risk. Some issues were found that should be addressed."
+        if risk >= 20:
+            return f"[{mode}] This change is low risk but has minor issues worth reviewing."
+        return f"[{mode}] This change appears safe. No significant issues detected."
+
+    def _fallback_reason(self, risk: int, quality: int, security: int) -> str:
+        return (
+            f"Risk score {risk}/100 derived from: security score {security}/100, "
+            f"quality score {quality}/100. "
+            "Score computed via weighted combination: safety 30%, security 30%, quality 25%, behavior 15%."
+        )
+
+    def _fallback_impact(self, findings: str) -> str:
+        if not findings or findings == "No specific findings":
+            return "No behavioral changes detected. The code change appears semantically equivalent to the baseline."
+        return (
+            f"The following changes may affect runtime behavior: {findings[:300]}. "
+            "Review execution paths carefully before deploying."
+        )
+
+    def _safe_defaults(self, risk: int, quality: int, security: int, findings: str, mode: str) -> Dict:
+        return {
+            "technical_explanation": self._fallback_tech(risk, findings, mode),
+            "human_explanation":     self._fallback_human(risk, mode),
+            "risk_reasoning":        self._fallback_reason(risk, quality, security),
+            "behavioral_impact":     self._fallback_impact(findings),
+            "ai_provider":           "None",
+        }
+
 # ============================================================================
-# PR COMMENT FORMATTER (Feature 1)
+# PR COMMENT FORMATTER
 # ============================================================================
 
 class PRCommentFormatter:
@@ -962,23 +1090,32 @@ class PRCommentFormatter:
 
     @staticmethod
     def format(analysis: Dict[str, Any]) -> str:
-        sev   = analysis.get("severity", "UNKNOWN")
-        risk  = analysis.get("risk_score", analysis.get("risk", 0))
-        sec   = analysis.get("security_score", "N/A")
-        ovr   = analysis.get("overall_score", "N/A")
-        qual  = analysis.get("quality_score", "N/A")
-        status= analysis.get("status", "UNKNOWN")
-        beh   = analysis.get("behavior", {})
-        beh_c = beh.get("changed", False)
-        beh_s = beh.get("summary", "")
-        ep    = analysis.get("execution_prediction", {})
-        outs  = ep.get("possible_outputs", [])[:3]
-        excs  = ep.get("exceptions", [])[:3]
-        tech  = analysis.get("technical_explanation", "")
-        human = analysis.get("human_explanation", "")
-        rid   = analysis.get("report_id", "")
+        sev    = analysis.get("severity", "UNKNOWN")
+        risk   = analysis.get("risk_score", analysis.get("risk", 0))
+        sec    = analysis.get("security_score", "N/A")
+        ovr    = analysis.get("overall_score", "N/A")
+        qual   = analysis.get("quality_score", "N/A")
+        status = analysis.get("status", "UNKNOWN")
+        mode   = analysis.get("mode", "N/A")
+        beh    = analysis.get("behavior", {})
+        beh_c  = beh.get("changed", False)
+        beh_s  = beh.get("summary", "")
+        ep     = analysis.get("execution_prediction", {})
+        outs   = ep.get("possible_outputs", [])[:3]
+        excs   = ep.get("exceptions", [])[:3]
+        tech   = analysis.get("technical_explanation", "")
+        human  = analysis.get("human_explanation", "")
+        reason = analysis.get("risk_reasoning", "")
+        impact = analysis.get("behavioral_impact", "")
+        rid    = analysis.get("report_id", "")
 
-        emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "SAFE": "🟢"}.get(sev, "⚪")
+        hashes = (
+            f"old: `{analysis.get('old_hash','N/A')[:16]}…`  "
+            f"new: `{analysis.get('new_hash','N/A')[:16]}…`  "
+            f"semantic: `{analysis.get('semantic_hash','N/A')[:16]}…`"
+        )
+
+        emoji    = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "SAFE": "🟢"}.get(sev, "⚪")
         beh_line = "✅ No behavior change" if not beh_c else f"⚠️ **YES** — {beh_s}"
         out_md   = "\n".join(f"- `{o}`" for o in outs) if outs else "_No explicit outputs_"
         exc_md   = "\n".join(f"- ⚠️ `{e}`" for e in excs) if excs else "_None detected_"
@@ -987,12 +1124,16 @@ class PRCommentFormatter:
 
 | Metric | Score |
 |---|---|
+| Mode | **{mode}** |
 | Risk Score | **{risk}/100** |
 | Security Score | **{sec}/100** |
 | Quality Score | **{qual}/100** |
 | Overall Score | **{ovr}/100** |
 | Status | **{status}** |
 | Severity | **{sev}** |
+
+### 🔑 Hashes
+{hashes}
 
 ### 🔄 Behavior Change Detection
 {beh_line}
@@ -1010,6 +1151,12 @@ class PRCommentFormatter:
 ### 💬 Human Explanation
 > {human[:500] if human else "_Unavailable_"}
 
+### 📊 Risk Reasoning
+> {reason[:400] if reason else "_Unavailable_"}
+
+### 🔁 Behavioral Impact
+> {impact[:400] if impact else "_Unavailable_"}
+
 ---
 *Report ID: `{rid}`* | *Powered by [CRONOS](https://github.com/cythonvijay/cronos-action)*
 """
@@ -1024,26 +1171,28 @@ class PRCommentFormatter:
             "Content-Type": "application/json",
         }
         url  = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-        resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
-        if resp.status_code in (200, 201):
-            return resp.json()
-        print(f"[CRONOS] PR comment failed: {resp.status_code} {resp.text[:200]}")
+        try:
+            resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            print(f"[CRONOS] PR comment failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"[CRONOS] PR comment exception: {e}")
         return None
 
-
 # ============================================================================
-# GITHUB CHECKS / ANNOTATIONS (Feature 2)
+# GITHUB CHECK RUNS / ANNOTATIONS
 # ============================================================================
 
 def _sev_to_level(sev: str) -> str:
     return {"CRITICAL": "failure", "HIGH": "failure", "MEDIUM": "warning", "LOW": "notice", "SAFE": "notice"}.get(sev.upper(), "warning")
 
 def create_check_run(token: str, owner: str, repo: str, sha: str, analysis: Dict, filename: str) -> Optional[Dict]:
-    sev       = analysis.get("severity", "UNKNOWN")
-    risk      = analysis.get("risk_score", 0)
-    status    = analysis.get("status", "PASS")
+    sev        = analysis.get("severity", "UNKNOWN")
+    risk       = analysis.get("risk_score", 0)
+    status     = analysis.get("status", "PASS")
     conclusion = "success" if status == "PASS" else "failure" if status == "FAIL" else "neutral"
-    level     = _sev_to_level(sev)
+    level      = _sev_to_level(sev)
 
     annotations = []
     for f in analysis.get("risk_findings", [])[:5]:
@@ -1053,7 +1202,7 @@ def create_check_run(token: str, owner: str, repo: str, sha: str, analysis: Dict
                              "message": f"[CRONOS Risk] {msgs[0] if msgs else 'Issue detected'}",
                              "title": f"Risk: {f.get('name', 'Finding')}"})
     for sf in analysis.get("security_findings", [])[:5]:
-        sl = _sev_to_level(sf.get("severity", "medium"))
+        sl  = _sev_to_level(sf.get("severity", "medium"))
         cwe = sf.get("cwe", "")
         annotations.append({"path": filename, "start_line": 1, "end_line": 1,
                              "annotation_level": sl,
@@ -1073,22 +1222,34 @@ def create_check_run(token: str, owner: str, repo: str, sha: str, analysis: Dict
         "status":     "completed",
         "conclusion": conclusion,
         "output": {
-            "title":       f"CRONOS — {sev} | Risk {risk}/100 | {status}",
-            "summary":     f"**Severity:** {sev}  \n**Risk:** {risk}/100  \n**Security:** {analysis.get('security_score','N/A')}/100  \n**Overall:** {analysis.get('overall_score','N/A')}/100",
-            "text":        f"### Technical\n{analysis.get('technical_explanation','')[:800]}\n\n### Human\n{analysis.get('human_explanation','')[:800]}",
+            "title":   f"CRONOS — {sev} | Risk {risk}/100 | {status}",
+            "summary": (
+                f"**Severity:** {sev}  \n"
+                f"**Risk:** {risk}/100  \n"
+                f"**Security:** {analysis.get('security_score','N/A')}/100  \n"
+                f"**Overall:** {analysis.get('overall_score','N/A')}/100"
+            ),
+            "text": (
+                f"### Technical\n{analysis.get('technical_explanation','N/A')[:800]}\n\n"
+                f"### Human\n{analysis.get('human_explanation','N/A')[:800]}\n\n"
+                f"### Risk Reasoning\n{analysis.get('risk_reasoning','N/A')[:400]}\n\n"
+                f"### Behavioral Impact\n{analysis.get('behavioral_impact','N/A')[:400]}"
+            ),
             "annotations": annotations[:50],
         },
     }
-    url  = f"https://api.github.com/repos/{owner}/{repo}/check-runs"
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    if resp.status_code in (200, 201):
-        return resp.json()
-    print(f"[CRONOS] Check run failed: {resp.status_code}")
+    url = f"https://api.github.com/repos/{owner}/{repo}/check-runs"
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code in (200, 201):
+            return resp.json()
+        print(f"[CRONOS] Check run failed: {resp.status_code}")
+    except Exception as e:
+        print(f"[CRONOS] Check run exception: {e}")
     return None
 
-
 # ============================================================================
-# METADATA STORE (Feature 4 — zero code retention)
+# METADATA STORE (zero code retention)
 # ============================================================================
 
 class MetadataStore:
@@ -1131,9 +1292,9 @@ class MetadataStore:
         return {
             "repo": repo, "entries": entries, "count": n,
             "averages": {
-                "risk_score":    round(sum(e["risk_score"]    for e in entries) / n, 1),
+                "risk_score":     round(sum(e["risk_score"]     for e in entries) / n, 1),
                 "security_score": round(sum(e["security_score"] for e in entries) / n, 1),
-                "overall_score": round(sum(e["overall_score"] for e in entries) / n, 1),
+                "overall_score":  round(sum(e["overall_score"]  for e in entries) / n, 1),
             },
         }
 
@@ -1165,7 +1326,6 @@ class MetadataStore:
                     (threshold, limit)).fetchall()]
         except: return []
 
-
 # ============================================================================
 # CORE ANALYSIS RUNNER
 # ============================================================================
@@ -1176,6 +1336,7 @@ _sec   = SecurityAnalyzer()
 _pred  = ExecutionPredictor()
 _ai_ex = AIExplainer()
 
+
 async def run_full_analysis(
     old_code: str, new_code: str, mode: str = "STRICT",
     repo: str = "", file: str = "",
@@ -1184,13 +1345,13 @@ async def run_full_analysis(
     report_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().isoformat() + "Z"
 
-    # 1. Hashes
+    # 1. Hashes — always computed first
     hashes        = HashEngine.compute(old_code, new_code)
     old_hash      = hashes["old_hash"]
     new_hash      = hashes["new_hash"]
     semantic_hash = hashes["semantic_hash"]
 
-    # 2. Cache check — store only scores, rebuild full response on hit
+    # 2. Cache check (scores only — no source code retained in cache)
     cache_key = f"{semantic_hash}:{mode}"
     if cache_key in HASH_CACHE:
         scores = HASH_CACHE[cache_key]
@@ -1206,12 +1367,25 @@ async def run_full_analysis(
             "old_hash":        old_hash,
             "new_hash":        new_hash,
             "semantic_hash":   semantic_hash,
-            "pass":  RiskEngine.status(scores["risk_score"]) == "PASS",
-            "warn":  RiskEngine.status(scores["risk_score"]) == "WARN",
-            "fail":  RiskEngine.status(scores["risk_score"]) == "FAIL",
-            "report_id":  report_id,
-            "timestamp":  timestamp,
-            "cache_hit":  True,
+            # Cached responses still include placeholder explanations
+            "technical_explanation": f"[{mode}] Cached result. Risk: {scores['risk_score']}/100, Severity: {scores['severity']}.",
+            "human_explanation":     f"[{mode}] This analysis was retrieved from cache based on matching semantic hash.",
+            "risk_reasoning":        f"Risk score {scores['risk_score']} from previous identical analysis.",
+            "behavioral_impact":     "See cached findings for behavioral details.",
+            "ai_provider":           "Cache",
+            "execution_prediction":  {"possible_outputs": [], "exceptions": [], "confidence": 0.0, "execution_paths": 1},
+            "behavior":              {"changed": False, "summary": "Cached result", "changes": []},
+            "risk_findings":         [],
+            "quality_findings":      [],
+            "security_findings":     [],
+            "summary":               ["Cached result"],
+            "findings_count":        0,
+            "pass":   RiskEngine.status(scores["risk_score"]) == "PASS",
+            "warn":   RiskEngine.status(scores["risk_score"]) == "WARN",
+            "fail":   RiskEngine.status(scores["risk_score"]) == "FAIL",
+            "report_id":   report_id,
+            "timestamp":   timestamp,
+            "cache_hit":   True,
             "download_urls": {
                 "json":  f"/report/json/{report_id}",
                 "pdf":   f"/report/pdf/{report_id}",
@@ -1221,20 +1395,23 @@ async def run_full_analysis(
         REPORT_STORE[report_id] = cached
         return cached
 
-    # 3. Constraints
+    # 3. Mode-specific constraints
     constraints = {
         "STRICT":   Constraint(no_behavior_change=True,  allow_boundary_change=False),
         "BOUNDARY": Constraint(no_behavior_change=False, allow_boundary_change=True),
+        "CONTRACT": Constraint(no_behavior_change=False, allow_boundary_change=False),
     }.get(mode, Constraint(no_behavior_change=False, allow_boundary_change=False))
 
-    # 4. Parallel analysis
+    # 4. Parallel analysis layers
     def _risk():
-        return _intel.analyze_change(old_code, new_code, constraints) if old_code.strip() \
-               else _intel.analyze_compliance(new_code, "")
-    def _quality():   return _qual.analyze(new_code)
-    def _security():  return _sec.analyze(new_code)
+        if old_code.strip():
+            return _intel.analyze_change(old_code, new_code, constraints)
+        return _intel.analyze_compliance(new_code, "")
+
+    def _quality():    return _qual.analyze(new_code)
+    def _security():   return _sec.analyze(new_code)
     def _prediction(): return _pred.predict(new_code)
-    def _behavior():  return _intel.compare_behavior(old_code, new_code)
+    def _behavior():   return _intel.compare_behavior(old_code, new_code)
 
     (risk_res, qual_res, sec_res, pred_res, beh_res) = await asyncio.gather(
         loop.run_in_executor(_EXECUTOR, _risk),
@@ -1250,28 +1427,49 @@ async def run_full_analysis(
     exec_pred                             = pred_res
     behavior                              = beh_res
 
-    risk_score    = RiskEngine.normalize(raw_risk)
-    status        = RiskEngine.status(risk_score)
-    behavior_score= behavior.get("behavior_score", 100)
-    overall_score = RiskEngine.overall(raw_risk, quality_score, security_score, behavior_score)
-    severity      = RiskEngine.classify_severity(risk_score, security_score, behavior.get("changed", False), exec_pred)
+    risk_score     = RiskEngine.normalize(raw_risk)
+    status         = RiskEngine.status(risk_score)
+    behavior_score = behavior.get("behavior_score", 100)
+    overall_score  = RiskEngine.overall(raw_risk, quality_score, security_score, behavior_score)
+    severity       = RiskEngine.classify_severity(risk_score, security_score, behavior.get("changed", False), exec_pred)
 
-    # 5. AI explanation
+    # 5. AI explanation — always runs, never crashes pipeline
     def _explain():
-        return _ai_ex.explain(old_code, new_code, risk_findings, risk_score,
-                               quality_score, security_score, hashes,
-                               {"possible_outputs": exec_pred.get("possible_outputs", []),
-                                "exceptions": exec_pred.get("exceptions", []),
-                                "confidence": exec_pred.get("confidence", 0)})
+        return _ai_ex.explain(
+            old_code, new_code, risk_findings, risk_score,
+            quality_score, security_score, hashes,
+            {
+                "possible_outputs": exec_pred.get("possible_outputs", []),
+                "exceptions":       exec_pred.get("exceptions", []),
+                "confidence":       exec_pred.get("confidence", 0),
+            },
+            mode=mode,
+        )
+
     ai_fields = await loop.run_in_executor(_EXECUTOR, _explain)
 
-    # 6. Assemble — ZERO CODE RETENTION: source code never stored
+    # 6. Assemble result — ZERO CODE RETENTION
     result = {
-        "status":     status, "risk": risk_score, "risk_score": risk_score, "mode": mode,
-        "quality_score": quality_score, "security_score": security_score,
-        "overall_score": overall_score, "behavior_score": behavior_score,
-        "severity": severity,
-        "old_hash": old_hash, "new_hash": new_hash, "semantic_hash": semantic_hash,
+        "status":     status,
+        "risk":       risk_score,
+        "risk_score": risk_score,
+        "mode":       mode,
+        "quality_score":  quality_score,
+        "security_score": security_score,
+        "overall_score":  overall_score,
+        "behavior_score": behavior_score,
+        "severity":       severity,
+        # Hashes always present
+        "old_hash":      old_hash,
+        "new_hash":      new_hash,
+        "semantic_hash": semantic_hash,
+        # Full AI explanations always present
+        "technical_explanation": ai_fields.get("technical_explanation", ""),
+        "human_explanation":     ai_fields.get("human_explanation", ""),
+        "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
+        "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
+        "ai_provider":           ai_fields.get("ai_provider", "None"),
+        # Execution prediction
         "execution_prediction": {
             "possible_outputs": exec_pred.get("possible_outputs", []),
             "return_values":    exec_pred.get("return_values", []),
@@ -1283,30 +1481,35 @@ async def run_full_analysis(
             "confidence":       exec_pred.get("confidence", 0.0),
             "execution_paths":  exec_pred.get("execution_paths", 1),
         },
-        "behavior": {"changed": behavior.get("changed", False), "summary": behavior.get("summary", ""), "changes": behavior.get("changes", [])},
-        "technical_explanation": ai_fields.get("technical_explanation", ""),
-        "human_explanation":     ai_fields.get("human_explanation", ""),
-        "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
-        "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
-        "ai_provider":           ai_fields.get("ai_provider", "None"),
-        "summary":        [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No issues"],
-        "findings_count": len(risk_findings),
-        "risk_findings":  [f.dict() for f in risk_findings],
+        # Behavior
+        "behavior": {
+            "changed": behavior.get("changed", False),
+            "summary": behavior.get("summary", ""),
+            "changes": behavior.get("changes", []),
+        },
+        # Findings
+        "summary":          [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No issues"],
+        "findings_count":   len(risk_findings),
+        "risk_findings":    [f.dict() for f in risk_findings],
         "quality_findings": quality_issues,
         "security_findings": sec_findings,
-        "pass": status == "PASS", "warn": status == "WARN", "fail": status == "FAIL",
-        "metadata": risk_signals,
-        "report_id": report_id, "timestamp": timestamp, "cache_hit": False,
+        # Gate flags
+        "pass": status == "PASS",
+        "warn": status == "WARN",
+        "fail": status == "FAIL",
+        # Metadata
+        "metadata":    risk_signals,
+        "report_id":   report_id,
+        "timestamp":   timestamp,
+        "cache_hit":   False,
         "download_urls": {
-            "json": f"/report/json/{report_id}",
-            "pdf":  f"/report/pdf/{report_id}",
+            "json":  f"/report/json/{report_id}",
+            "pdf":   f"/report/pdf/{report_id}",
             "store": f"/report/store/{report_id}",
         },
     }
 
-    # 7. Store metadata (no source code)
-    # Cache stores ONLY scores — no explanations, findings, or metadata.
-    # Keeps HASH_CACHE lean: O(5 ints) per entry instead of O(N KB).
+    # 7. Cache scores only (no source code)
     HASH_CACHE[cache_key] = {
         "risk_score":     risk_score,
         "severity":       severity,
@@ -1316,6 +1519,7 @@ async def run_full_analysis(
     }
     REPORT_STORE[report_id] = result
 
+    # 8. Persist metadata to SQLite (no source code stored)
     MetadataStore.save(
         report_id, repo, file, timestamp,
         risk_score, security_score, overall_score,
@@ -1323,19 +1527,18 @@ async def run_full_analysis(
         mode, status,
     )
 
-    # Persist safe JSON report (no source code)
+    # 9. Persist safe JSON report (no source code)
     safe = {k: v for k, v in result.items()}
     try:
         with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding="utf-8") as fh:
             json.dump(safe, fh, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"⚠️ persist: {e}")
+        print(f"⚠️ persist JSON: {e}")
 
-    # ZERO CODE RETENTION — delete source from local scope immediately
+    # ZERO CODE RETENTION — delete source from local scope
     del old_code, new_code
 
     return result
-
 
 # ============================================================================
 # PDF GENERATION
@@ -1344,7 +1547,8 @@ async def run_full_analysis(
 def _generate_pdf(data: Dict) -> BytesIO:
     buf = BytesIO()
     c   = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4; y = h - 0.5*inch
+    w, h = A4
+    y = h - 0.5 * inch
 
     c.setFont("Helvetica-Bold", 20)
     c.drawString(0.5*inch, y, "CRONOS v8 — Intelligence Analysis Report"); y -= 0.3*inch
@@ -1354,18 +1558,22 @@ def _generate_pdf(data: Dict) -> BytesIO:
     c.setFont("Helvetica-Bold", 13)
     c.drawString(0.5*inch, y, "Scores"); y -= 0.22*inch
     c.setFont("Helvetica", 11)
-    for label, key in [("Risk Score", "risk_score"), ("Quality Score", "quality_score"),
-                       ("Security Score", "security_score"), ("Overall Score", "overall_score"),
-                       ("Severity", "severity"), ("Status", "status"), ("Mode", "mode")]:
-        c.drawString(0.75*inch, y, f"{label}: {data.get(key, 'N/A')}")
-        y -= 0.18*inch
+    for label, key in [
+        ("Mode",           "mode"),
+        ("Risk Score",     "risk_score"),
+        ("Quality Score",  "quality_score"),
+        ("Security Score", "security_score"),
+        ("Overall Score",  "overall_score"),
+        ("Severity",       "severity"),
+        ("Status",         "status"),
+    ]:
+        c.drawString(0.75*inch, y, f"{label}: {data.get(key, 'N/A')}"); y -= 0.18*inch
 
     for h_label, hash_key in [("Old Hash", "old_hash"), ("New Hash", "new_hash"), ("Semantic Hash", "semantic_hash")]:
         val = data.get(hash_key, "")
         if val:
             c.setFont("Courier", 9)
-            c.drawString(0.75*inch, y, f"{h_label}: {val[:48]}...")
-            y -= 0.16*inch
+            c.drawString(0.75*inch, y, f"{h_label}: {val[:48]}..."); y -= 0.16*inch
     c.setFont("Helvetica", 11)
 
     y -= 0.15*inch; c.setFont("Helvetica-Bold", 13); c.drawString(0.5*inch, y, "Key Findings"); y -= 0.22*inch
@@ -1386,12 +1594,20 @@ def _generate_pdf(data: Dict) -> BytesIO:
         c.setFont("Helvetica", 10)
         if y < 1*inch: c.showPage(); y = h - 0.5*inch
 
-    if y < 3*inch: c.showPage(); y = h - 0.5*inch
-    y -= 0.15*inch; c.setFont("Helvetica-Bold", 13); c.drawString(0.5*inch, y, "Technical Explanation"); y -= 0.22*inch
-    c.setFont("Helvetica", 9)
-    for line in _wrap(data.get("technical_explanation","N/A")[:600], c, w - 1.5*inch, "Helvetica", 9)[:20]:
-        c.drawString(0.75*inch, y, line); y -= 0.15*inch
-        if y < 0.5*inch: break
+    for section_title, field_key in [
+        ("Technical Explanation", "technical_explanation"),
+        ("Human Explanation",     "human_explanation"),
+        ("Risk Reasoning",        "risk_reasoning"),
+        ("Behavioral Impact",     "behavioral_impact"),
+    ]:
+        if y < 3*inch: c.showPage(); y = h - 0.5*inch
+        y -= 0.15*inch
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(0.5*inch, y, section_title); y -= 0.22*inch
+        c.setFont("Helvetica", 9)
+        for line in _wrap(data.get(field_key, "N/A")[:600], c, w - 1.5*inch, "Helvetica", 9)[:20]:
+            c.drawString(0.75*inch, y, line); y -= 0.15*inch
+            if y < 0.5*inch: break
 
     c.setFont("Helvetica-Oblique", 8)
     c.drawString(0.5*inch, 0.4*inch, "CRONOS v8.0.0 — Enterprise Intelligence Code Analyzer")
@@ -1400,21 +1616,15 @@ def _generate_pdf(data: Dict) -> BytesIO:
 
 def _wrap(text, c, max_w, font, size):
     words = text.split(); line = ""; lines = []
-    for w in words:
-        test = (line + " " + w).strip()
+    for word in words:
+        test = (line + " " + word).strip()
         if c.stringWidth(test, font, size) < max_w: line = test
-        else: lines.append(line); line = w
+        else: lines.append(line); line = word
     if line: lines.append(line)
     return lines
 
-
 # ============================================================================
-# ███████╗███╗   ██╗██████╗ ██████╗  ██████╗ ██╗███╗   ██╗████████╗███████╗
-# ██╔════╝████╗  ██║██╔══██╗██╔══██╗██╔═══██╗██║████╗  ██║╚══██╔══╝██╔════╝
-# █████╗  ██╔██╗ ██║██║  ██║██████╔╝██║   ██║██║██╔██╗ ██║   ██║   ███████╗
-# ██╔══╝  ██║╚██╗██║██║  ██║██╔═══╝ ██║   ██║██║██║╚██╗██║   ██║   ╚════██║
-# ███████╗██║ ╚████║██████╔╝██║     ╚██████╔╝██║██║ ╚████║   ██║   ███████║
-# ╚══════╝╚═╝  ╚═══╝╚═════╝ ╚═╝      ╚═════╝ ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝
+# ENDPOINTS
 # ============================================================================
 
 # ── POST /analyze_full ───────────────────────────────────────────────────────
@@ -1422,9 +1632,7 @@ def _wrap(text, c, max_w, font, size):
 async def analyze_full(req: FullAnalyzeRequest):
     """
     Full 6-layer enterprise intelligence report.
-    Features: severity classification, DB storage, PR comment formatting,
-    check run annotations, history tracking, dashboard data.
-    Target: < 5 seconds.
+    Always returns: status, severity, risk_score, all 4 AI explanation fields, hashes.
     """
     try:
         result = await run_full_analysis(req.old_code, req.new_code, req.mode, req.repo, req.file)
@@ -1433,13 +1641,10 @@ async def analyze_full(req: FullAnalyzeRequest):
         raise HTTPException(500, f"Analysis error: {e}")
 
 
-# ── POST /analyze_realtime (Feature 6 — IDE plugin) ─────────────────────────
+# ── POST /analyze_realtime ────────────────────────────────────────────────────
 @app.post("/analyze_realtime")
 async def analyze_realtime(req: RealtimeAnalyzeRequest):
-    """
-    Realtime IDE plugin endpoint. Target: < 2 seconds.
-    Input: { "code": "...", "filename": "..." }
-    """
+    """IDE plugin endpoint. Target: < 2 seconds."""
     import time; t0 = time.time()
     code     = req.code
     filename = req.filename
@@ -1449,83 +1654,85 @@ async def analyze_realtime(req: RealtimeAnalyzeRequest):
         quality,  qi = _qual.analyze(code)
         security, si = _sec.analyze(code)
         pred         = _pred.predict(code)
-        risk_score   = 0
-        # Quick risk estimate from security findings
         sev_w = {"critical": 30, "high": 15, "medium": 8, "low": 3}
         penalty = sum(sev_w.get(f.get("severity","low"), 3) for f in si)
-        risk_score = min(100, penalty)
-        risk_score = RiskEngine.normalize(risk_score)
+        risk_score = RiskEngine.normalize(min(100, penalty))
         severity   = RiskEngine.classify_severity(risk_score, security, False, pred)
         return quality, qi, security, si, pred, risk_score, severity
 
     quality, qi, security, si, pred, risk_score, severity = await loop.run_in_executor(_EXECUTOR, _run_all)
 
+    hashes = HashEngine.compute("", code)
+
     def _explain_rt():
         return _ai_ex.realtime_explain(code, si, risk_score, security)
+
     ai = await loop.run_in_executor(_EXECUTOR, _explain_rt)
 
     elapsed = round(time.time() - t0, 3)
 
     result = {
-        "filename": filename,
-        "risk_score": risk_score,
+        "filename":       filename,
+        "risk_score":     risk_score,
         "security_score": security,
-        "quality_score": quality,
-        "overall_score": RiskEngine.overall(risk_score, quality, security, 100),
-        "severity": severity,
-        "status": RiskEngine.status(risk_score),
+        "quality_score":  quality,
+        "overall_score":  RiskEngine.overall(risk_score, quality, security, 100),
+        "severity":       severity,
+        "status":         RiskEngine.status(risk_score),
+        "old_hash":       hashes["old_hash"],
+        "new_hash":       hashes["new_hash"],
+        "semantic_hash":  hashes["semantic_hash"],
         "execution_prediction": {
             "possible_outputs": pred.get("possible_outputs", []),
-            "exceptions": pred.get("exceptions", []),
-            "confidence": pred.get("confidence", 0),
+            "exceptions":       pred.get("exceptions", []),
+            "confidence":       pred.get("confidence", 0),
         },
-        "security_findings": si[:10],
-        "quality_findings": qi[:10],
-        "technical_explanation": ai.get("technical_explanation",""),
-        "human_explanation":     ai.get("human_explanation",""),
-        "risk_reasoning":        ai.get("risk_reasoning",""),
-        "behavioral_impact":     ai.get("behavioral_impact",""),
-        "ai_provider":           ai.get("ai_provider","None"),
-        "elapsed_seconds": elapsed,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "security_findings":     si[:10],
+        "quality_findings":      qi[:10],
+        "technical_explanation": ai.get("technical_explanation", ""),
+        "human_explanation":     ai.get("human_explanation", ""),
+        "risk_reasoning":        ai.get("risk_reasoning", ""),
+        "behavioral_impact":     ai.get("behavioral_impact", ""),
+        "ai_provider":           ai.get("ai_provider", "None"),
+        "elapsed_seconds":       elapsed,
+        "timestamp":             datetime.utcnow().isoformat() + "Z",
     }
 
-    # Zero code retention
     del code
     return result
 
 
-# ── GET /history/{repo} (Feature 4) ─────────────────────────────────────────
+# ── GET /history/{repo} ──────────────────────────────────────────────────────
 @app.get("/history/{repo}")
 async def get_history(repo: str, limit: int = 100):
     return MetadataStore.history(repo, limit)
 
 
-# ── GET /trend/{repo} (Feature 4) ───────────────────────────────────────────
+# ── GET /trend/{repo} ───────────────────────────────────────────────────────
 @app.get("/trend/{repo}")
 async def get_trend(repo: str, limit: int = 30):
     return MetadataStore.trend(repo, limit)
 
 
-# ── GET /dashboard/summary (Feature 5) ──────────────────────────────────────
+# ── GET /dashboard/summary ───────────────────────────────────────────────────
 @app.get("/dashboard/summary")
 async def dashboard_summary():
     return MetadataStore.summary()
 
 
-# ── GET /dashboard/recent (Feature 5) ───────────────────────────────────────
+# ── GET /dashboard/recent ────────────────────────────────────────────────────
 @app.get("/dashboard/recent")
 async def dashboard_recent(limit: int = 20):
     return MetadataStore.recent(limit)
 
 
-# ── GET /dashboard/high_risk (Feature 5) ────────────────────────────────────
+# ── GET /dashboard/high_risk ─────────────────────────────────────────────────
 @app.get("/dashboard/high_risk")
 async def dashboard_high_risk(threshold: int = 60, limit: int = 50):
     return MetadataStore.high_risk(threshold, limit)
 
 
-# ── POST /github/pr_comment (Feature 1 — server-side posting) ───────────────
+# ── POST /github/pr_comment ──────────────────────────────────────────────────
 @app.post("/github/pr_comment")
 async def post_pr_comment(request: Request):
     """
@@ -1547,13 +1754,19 @@ async def post_pr_comment(request: Request):
     if not token:
         raise HTTPException(400, "github_token required")
 
+    # Parse owner/repo from "owner/repo" string if needed
+    raw_repo  = body.get("repo", "")
+    parts     = raw_repo.split("/")
+    owner_val = body.get("owner", parts[0] if len(parts) >= 2 else "")
+    repo_val  = parts[-1] if len(parts) >= 2 else raw_repo
+
     result = PRCommentFormatter.post(
-        token, body.get("owner",""), body.get("repo",""), body.get("pr_number", 0), analysis
+        token, owner_val, repo_val, int(body.get("pr_number", 0)), analysis
     )
     return {"success": result is not None, "comment": result}
 
 
-# ── POST /github/check_run (Feature 2 — server-side annotations) ─────────────
+# ── POST /github/check_run ───────────────────────────────────────────────────
 @app.post("/github/check_run")
 async def post_check_run(request: Request):
     """
@@ -1582,7 +1795,7 @@ async def post_check_run(request: Request):
     return {"success": result is not None, "check_run": result}
 
 
-# ── ORIGINAL /analyze and /analyze_ci (preserved) ───────────────────────────
+# ── POST /analyze (legacy CHANGE/COMPLIANCE) ─────────────────────────────────
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     mode = req.mode; report_id = str(uuid.uuid4())
@@ -1594,17 +1807,25 @@ async def analyze(req: AnalyzeRequest):
             findings, raw_risk, signals = _intel.analyze_change(old_code, new_code, req.constraints)
             risk = RiskEngine.normalize(raw_risk); status = RiskEngine.status(risk)
             quality, qi = _qual.analyze(new_code); security, si = _sec.analyze(new_code)
-            behavior     = _intel.compare_behavior(old_code, new_code)
-            overall      = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score",100))
-            tech, prov   = _ai(f"Mode=CHANGE Risk={risk} Findings={len(findings)} — explain in 100 words")
+            behavior    = _intel.compare_behavior(old_code, new_code)
+            overall     = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score", 100))
+            hashes      = HashEngine.compute(old_code, new_code)
+            severity    = RiskEngine.classify_severity(risk, security, behavior.get("changed", False), {})
+            ai_fields   = _ai_ex.explain(old_code, new_code, findings, risk, quality, security, hashes, {}, mode="CHANGE")
             result = {
                 "mode": mode, "status": status, "risk_score": risk, "quality_score": quality,
-                "security_score": security, "overall_score": overall,
-                "severity": RiskEngine.classify_severity(risk, security, behavior.get("changed",False), {}),
+                "security_score": security, "overall_score": overall, "severity": severity,
+                "old_hash":      hashes["old_hash"],
+                "new_hash":      hashes["new_hash"],
+                "semantic_hash": hashes["semantic_hash"],
                 "analyzer_findings": [f.dict() for f in findings],
                 "quality_findings": qi, "security_findings": si,
                 "behavior": {"changed": behavior["changed"], "summary": behavior["summary"]},
-                "technical_explanation": tech, "ai_provider": prov,
+                "technical_explanation": ai_fields.get("technical_explanation", ""),
+                "human_explanation":     ai_fields.get("human_explanation", ""),
+                "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
+                "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
+                "ai_provider": ai_fields.get("ai_provider", "None"),
                 "report_id": report_id, "timestamp": datetime.utcnow().isoformat() + "Z",
             }
         elif mode == "COMPLIANCE":
@@ -1612,19 +1833,28 @@ async def analyze(req: AnalyzeRequest):
             findings, raw_risk, signals = _intel.analyze_compliance(req.source_code, req.expected_output)
             risk = RiskEngine.normalize(raw_risk); status = RiskEngine.status(risk)
             quality, qi = _qual.analyze(req.source_code); security, si = _sec.analyze(req.source_code)
-            overall = RiskEngine.overall(risk, quality, security, 100)
-            tech, prov = _ai(f"Compliance risk={risk} similarity analysis — explain in 80 words")
+            overall  = RiskEngine.overall(risk, quality, security, 100)
+            hashes   = HashEngine.compute("", req.source_code)
+            severity = RiskEngine.classify_severity(risk, security, False, {})
+            ai_fields = _ai_ex.explain("", req.source_code, findings, risk, quality, security, hashes, {}, mode="COMPLIANCE")
             result = {
                 "mode": mode, "status": status, "risk_score": risk, "quality_score": quality,
-                "security_score": security, "overall_score": overall,
-                "severity": RiskEngine.classify_severity(risk, security, False, {}),
+                "security_score": security, "overall_score": overall, "severity": severity,
+                "old_hash":      hashes["old_hash"],
+                "new_hash":      hashes["new_hash"],
+                "semantic_hash": hashes["semantic_hash"],
                 "analyzer_findings": [f.dict() for f in findings],
                 "quality_findings": qi, "security_findings": si,
-                "technical_explanation": tech, "ai_provider": prov,
+                "technical_explanation": ai_fields.get("technical_explanation", ""),
+                "human_explanation":     ai_fields.get("human_explanation", ""),
+                "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
+                "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
+                "ai_provider": ai_fields.get("ai_provider", "None"),
                 "report_id": report_id, "timestamp": datetime.utcnow().isoformat() + "Z",
             }
         else:
             raise HTTPException(400, f"Invalid mode '{mode}'")
+
         try:
             with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding="utf-8") as fh:
                 json.dump(result, fh, indent=2, ensure_ascii=False)
@@ -1634,6 +1864,7 @@ async def analyze(req: AnalyzeRequest):
     except Exception as e: raise HTTPException(500, str(e))
 
 
+# ── GET/POST /analyze_ci ─────────────────────────────────────────────────────
 @app.get("/analyze_ci")
 async def analyze_ci_get():
     return {"status": "OK", "message": "POST with {old_code, new_code, mode}"}
@@ -1643,29 +1874,58 @@ async def analyze_ci(request: Request):
     try:
         body = await request.json()
     except:
-        return JSONResponse(status_code=400, content={"status":"FAIL","risk":100,"summary":["Invalid JSON"],"pass":False,"warn":False,"fail":True})
-    old_code = body.get("old_code",""); new_code = body.get("new_code",""); mode = str(body.get("mode","STRICT")).upper()
+        return JSONResponse(status_code=400, content={
+            "status":"FAIL","risk":100,"summary":["Invalid JSON"],
+            "pass":False,"warn":False,"fail":True,
+        })
+
+    old_code = body.get("old_code", "")
+    new_code = body.get("new_code", "")
+    mode     = str(body.get("mode", "STRICT")).upper()
     if not new_code:
-        return JSONResponse(status_code=400, content={"status":"FAIL","risk":100,"summary":["new_code required"],"pass":False,"warn":False,"fail":True})
+        return JSONResponse(status_code=400, content={
+            "status":"FAIL","risk":100,"summary":["new_code required"],
+            "pass":False,"warn":False,"fail":True,
+        })
     mode = mode if mode in ("STRICT","BOUNDARY","CONTRACT") else "STRICT"
+
     try:
-        constraints = {"STRICT": Constraint(no_behavior_change=True), "BOUNDARY": Constraint(allow_boundary_change=True)}.get(mode, Constraint())
-        findings, raw, meta = _intel.analyze_change(old_code, new_code, constraints) if old_code.strip() else _intel.analyze_compliance(new_code, "")
-        risk = RiskEngine.normalize(raw); status = RiskEngine.status(risk)
-        quality, _ = _qual.analyze(new_code); security, _ = _sec.analyze(new_code)
+        constraints = {
+            "STRICT":   Constraint(no_behavior_change=True),
+            "BOUNDARY": Constraint(allow_boundary_change=True),
+        }.get(mode, Constraint())
+
+        findings, raw, meta = (
+            _intel.analyze_change(old_code, new_code, constraints)
+            if old_code.strip()
+            else _intel.analyze_compliance(new_code, "")
+        )
+        risk     = RiskEngine.normalize(raw)
+        status   = RiskEngine.status(risk)
+        quality, _ = _qual.analyze(new_code)
+        security, _ = _sec.analyze(new_code)
         behavior   = _intel.compare_behavior(old_code, new_code)
-        overall    = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score",100))
-        severity   = RiskEngine.classify_severity(risk, security, behavior.get("changed",False), {})
+        overall    = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score", 100))
+        severity   = RiskEngine.classify_severity(risk, security, behavior.get("changed", False), {})
+        hashes     = HashEngine.compute(old_code, new_code)
+
         return JSONResponse(content={
             "risk": risk, "status": status, "mode": mode, "severity": severity,
-            "findings_count": len(findings), "summary": [f.findings[0] for f in findings[:5]] or ["No issues"],
+            "findings_count": len(findings),
+            "summary": [f.findings[0] for f in findings[:5]] or ["No issues"],
             "quality_score": quality, "security_score": security, "overall_score": overall,
-            "behavior_changed": behavior.get("changed",False),
+            "behavior_changed": behavior.get("changed", False),
+            "old_hash":      hashes["old_hash"],
+            "new_hash":      hashes["new_hash"],
+            "semantic_hash": hashes["semantic_hash"],
             "pass": status=="PASS", "warn": status=="WARN", "fail": status=="FAIL",
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
     except Exception as e:
-        return JSONResponse(status_code=500, content={"status":"FAIL","risk":100,"summary":[str(e)],"pass":False,"warn":False,"fail":True})
+        return JSONResponse(status_code=500, content={
+            "status":"FAIL","risk":100,"summary":[str(e)],
+            "pass":False,"warn":False,"fail":True,
+        })
 
 
 # ── REPORT ENDPOINTS ─────────────────────────────────────────────────────────
@@ -1684,7 +1944,10 @@ async def report_json(report_id: str):
     path = f"{REPORT_DIR}/{report_id}.json"
     if not os.path.exists(path): raise HTTPException(404, f"Not found: {report_id}")
     with open(path, encoding="utf-8") as fh:
-        return JSONResponse(content=json.load(fh), headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.json"'})
+        return JSONResponse(
+            content=json.load(fh),
+            headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.json"'},
+        )
 
 @app.get("/report/pdf/{report_id}")
 async def report_pdf(report_id: str):
@@ -1692,40 +1955,49 @@ async def report_pdf(report_id: str):
     if not os.path.exists(path): raise HTTPException(404, f"Not found: {report_id}")
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
-    return StreamingResponse(_generate_pdf(data), media_type="application/pdf",
-                             headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.pdf"'})
+    return StreamingResponse(
+        _generate_pdf(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.pdf"'},
+    )
 
 
 # ── HEALTH ───────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
     return {
-        "status": "ok",
+        "status":  "ok",
         "service": "CRONOS v8.0.0 — Enterprise Intelligence Code Analyzer",
         "version": "8.0.0",
+        "stages": {
+            "stage_1": "BOUNDARY — boundary condition analysis",
+            "stage_2": "CONTRACT — contract compliance analysis",
+            "stage_3": "STRICT   — strict behavioral enforcement",
+            "stage_4": "UNIFIED INTELLIGENCE — runs only when all 3 pass",
+        },
         "features": {
             "feature_1": "Automatic PR Comments (POST /github/pr_comment)",
             "feature_2": "Inline Code Annotations (POST /github/check_run)",
-            "feature_3": "Security Severity Classification (severity field in all responses)",
+            "feature_3": "Security Severity Classification (severity in all responses)",
             "feature_4": "Historical Trend Tracking (GET /history/{repo}, GET /trend/{repo})",
             "feature_5": "Dashboard UI Backend (GET /dashboard/*)",
             "feature_6": "IDE Plugin Support (POST /analyze_realtime)",
         },
         "endpoints": {
-            "POST /analyze_full":       "Full 6-layer enterprise intelligence report",
-            "POST /analyze_realtime":   "IDE plugin — sub-2s analysis",
-            "POST /analyze":            "Advanced analysis (CHANGE/COMPLIANCE)",
-            "POST /analyze_ci":         "CI/CD fast gate",
-            "POST /github/pr_comment":  "Post PR intelligence comment",
-            "POST /github/check_run":   "Create Check Run with annotations",
-            "GET  /history/{repo}":     "Historical reports",
-            "GET  /trend/{repo}":       "Trend data for dashboard",
-            "GET  /dashboard/summary":  "Dashboard summary",
-            "GET  /dashboard/recent":   "Recent reports",
-            "GET  /dashboard/high_risk":"High risk reports",
-            "GET  /report/json/{id}":   "Download JSON report",
-            "GET  /report/pdf/{id}":    "Download PDF report",
-            "GET  /report/store/{id}":  "In-memory report retrieval",
+            "POST /analyze_full":      "Full 6-layer enterprise intelligence (all 4 AI explanations)",
+            "POST /analyze_realtime":  "IDE plugin — sub-2s analysis",
+            "POST /analyze":           "Advanced analysis (CHANGE/COMPLIANCE)",
+            "POST /analyze_ci":        "CI/CD fast gate",
+            "POST /github/pr_comment": "Post PR intelligence comment",
+            "POST /github/check_run":  "Create Check Run with annotations",
+            "GET  /history/{repo}":    "Historical reports",
+            "GET  /trend/{repo}":      "Trend data for dashboard",
+            "GET  /dashboard/summary": "Dashboard summary",
+            "GET  /dashboard/recent":  "Recent reports",
+            "GET  /dashboard/high_risk": "High risk reports",
+            "GET  /report/json/{id}":  "Download JSON report",
+            "GET  /report/pdf/{id}":   "Download PDF report",
+            "GET  /report/store/{id}": "In-memory report retrieval",
         },
         "security": {
             "zero_code_retention": True,
@@ -1735,8 +2007,14 @@ async def health():
         "intelligence": {
             "gemini":     bool(GEMINI_API_KEY),
             "openrouter": OPENROUTER_ENABLED,
-            "layers": ["IntelligenceEngine", "CodeQualityAnalyzer", "SecurityAnalyzer",
-                       "ExecutionPredictor", "AIExplainer", "RiskEngine"],
+            "layers": [
+                "IntelligenceEngine",
+                "CodeQualityAnalyzer",
+                "SecurityAnalyzer",
+                "ExecutionPredictor",
+                "AIExplainer",
+                "RiskEngine",
+            ],
         },
     }
 
@@ -1748,14 +2026,20 @@ async def startup():
     print("=" * 80)
     print("✅ CRONOS v8.0.0 — ENTERPRISE INTELLIGENCE CODE ANALYZER")
     print("=" * 80)
-    print(f"🤖 Gemini    : {'✅ Enabled' if GEMINI_API_KEY else '❌ Disabled'}")
+    print(f"🤖 Gemini    : {'✅ Enabled' if GEMINI_API_KEY     else '❌ Disabled'}")
     print(f"🤖 OpenRouter: {'✅ Enabled' if OPENROUTER_ENABLED else '❌ Disabled'}")
     print(f"🗄️  Database  : {DB_PATH}")
+    print()
+    print("🏗️  STAGES:")
+    print("  Stage 1 — BOUNDARY        (always runs)")
+    print("  Stage 2 — CONTRACT        (always runs)")
+    print("  Stage 3 — STRICT          (always runs)")
+    print("  Stage 4 — UNIFIED INTEL   (only if all 3 pass)")
     print()
     print("🏢 ENTERPRISE FEATURES:")
     print("  ✓ F1 — Automatic PR Comments")
     print("  ✓ F2 — Inline Code Annotations (Check Runs)")
-    print("  ✓ F3 — Security Severity Classification (CRITICAL/HIGH/MEDIUM/LOW/SAFE)")
+    print("  ✓ F3 — Security Severity Classification")
     print("  ✓ F4 — Historical Trend Tracking (SQLite)")
     print("  ✓ F5 — Dashboard UI Backend")
     print("  ✓ F6 — IDE Plugin Support (realtime < 2s)")
