@@ -24,7 +24,12 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    _GENAI_AVAILABLE = False
 
 
 # ============================================================================
@@ -34,7 +39,7 @@ import google.generativeai as genai
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-if GEMINI_API_KEY:
+if GEMINI_API_KEY and _GENAI_AVAILABLE:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 else:
@@ -48,14 +53,15 @@ OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
 
 app = FastAPI(
     title="CRONOS – Advanced Intelligence Code Analyzer",
-    version="7.0.0",
+    version="8.0.0",
     description="Enterprise-grade Python static analysis: SonarQube + AI Semantic Reasoning + Execution Prediction"
 )
 
+# BUG FIX 2: "*" and explicit origins cannot coexist — removed wildcard,
+# kept only the explicit allow-list.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "*",
         "https://cronoscodeanalyzer.vercel.app",
         "http://localhost:3000",
         "http://localhost:5500",
@@ -146,20 +152,10 @@ class FullAnalyzeRequest(BaseModel):
         return v.upper()
 
 # ---------------------------------------------------------------------------
-# Hash utility — three hashes used throughout v7
+# Hash utility — three hashes used throughout v8
 # ---------------------------------------------------------------------------
 
 def compute_hashes(old_code: str, new_code: str) -> Dict[str, str]:
-    """
-    Generate:
-      old_hash     = SHA256(old_code)
-      new_hash     = SHA256(new_code)
-      semantic_hash = SHA256(AST-dump of new_code)  — structure-only, ignores whitespace/comments
-
-    If new_code is syntactically invalid, semantic_hash is set to the special
-    sentinel "UNPARSEABLE:<new_hash>" so it never matches any cache entry and
-    the broken code is always re-analysed (and failed) immediately.
-    """
     old_hash = hashlib.sha256(old_code.encode('utf-8')).hexdigest() if old_code.strip() else ""
     new_hash = hashlib.sha256(new_code.encode('utf-8')).hexdigest()
 
@@ -168,8 +164,6 @@ def compute_hashes(old_code: str, new_code: str) -> Dict[str, str]:
         ast_repr = ast.dump(tree, indent=None)
         semantic_hash = hashlib.sha256(ast_repr.encode('utf-8')).hexdigest()
     except SyntaxError:
-        # Sentinel: ensures syntax-broken code never hits the cache and
-        # always flows through to the analyzers (which will return risk=100).
         semantic_hash = f"UNPARSEABLE:{new_hash}"
     except Exception:
         semantic_hash = f"UNPARSEABLE:{new_hash}"
@@ -261,16 +255,6 @@ def get_status(risk: int) -> str:
     return pass_fail_from_risk(risk)
 
 def compute_severity(risk_score: int) -> str:
-    """
-    Maps a normalised risk score (0-100) to a severity label.
-    Used by all endpoints so the action.yml severity gate works correctly.
-
-        0        → SAFE
-        1–20     → LOW
-        21–40    → MEDIUM
-        41–60    → HIGH
-        61–100   → CRITICAL
-    """
     if risk_score <= 0:   return "SAFE"
     elif risk_score <= 20: return "LOW"
     elif risk_score <= 40: return "MEDIUM"
@@ -294,8 +278,11 @@ class CodeQualityAnalyzer:
         try:
             tree = safe_ast(code)
         except ValueError as e:
-            # Return 0 quality score and mark as critical so overall_score is dragged down.
             return 0, [{"type": "SyntaxError", "message": f"Code contains a syntax error: {str(e)}", "severity": "critical"}]
+
+        # BUG FIX 1: `lines` was referenced but never defined — compute it here
+        # so _detect_complex_functions (which receives it) can use it.
+        lines = code.splitlines()
 
         # Unused variables
         issues.extend(self._detect_unused_variables(tree))
@@ -435,13 +422,15 @@ class CodeQualityAnalyzer:
                 except Exception:
                     pass
 
-        for cond, lines in condition_map.items():
-            if len(lines) > 1:
+        # BUG FIX 5: renamed loop variable from `lines` to `occurrences`
+        # to avoid shadowing the `lines` parameter in the outer analyze() scope.
+        for cond, occurrences in condition_map.items():
+            if len(occurrences) > 1:
                 issues.append({
                     "type": "DuplicateLogic",
-                    "message": f"Condition '{cond[:60]}' appears {len(lines)} times — consider extracting to a function",
+                    "message": f"Condition '{cond[:60]}' appears {len(occurrences)} times — consider extracting to a function",
                     "severity": "low",
-                    "lines": lines
+                    "lines": occurrences
                 })
         return issues
 
@@ -623,12 +612,6 @@ class SecurityAnalyzer:
 # ============================================================================
 
 class ExecutionPredictor:
-    """
-    Simulates execution WITHOUT running code.
-    Analyzes AST to predict possible outputs, return values,
-    control flow branches, authentication logic outcomes.
-    """
-
     def predict(self, code: str) -> Dict[str, Any]:
         try:
             tree = safe_ast(code)
@@ -654,7 +637,6 @@ class ExecutionPredictor:
         state_changes = []
         exceptions = []
 
-        # Walk AST and extract predictions
         self._extract_returns(tree, return_values)
         self._extract_prints(tree, print_outputs)
         self._extract_branches(tree, branches)
@@ -669,7 +651,6 @@ class ExecutionPredictor:
         if not possible_outputs:
             possible_outputs = ["No explicit outputs detected (side-effects only)"]
 
-        # Confidence based on how much we could analyze
         total_nodes = sum(1 for _ in ast.walk(tree))
         analyzable = len(return_values) + len(print_outputs) + len(branches)
         confidence = min(0.95, 0.5 + (analyzable / max(total_nodes, 1)) * 0.5)
@@ -692,7 +673,6 @@ class ExecutionPredictor:
             if isinstance(node, ast.Return) and node.value is not None:
                 try:
                     val = ast.unparse(node.value)
-                    # Simplify string literals
                     if isinstance(node.value, ast.Constant):
                         results.append(f'→ returns: {repr(node.value.value)}')
                     elif isinstance(node.value, ast.Name):
@@ -771,9 +751,7 @@ class ExecutionPredictor:
                     pass
 
     def _extract_state_changes(self, tree: ast.AST, results: List):
-        """Detect assignments that mutate state (counters, flags, lists)."""
         for node in ast.walk(tree):
-            # AugAssign: x += 1, x -= 1, attempts += 1
             if isinstance(node, ast.AugAssign):
                 try:
                     target = ast.unparse(node.target)
@@ -782,7 +760,6 @@ class ExecutionPredictor:
                     results.append(f'State mutation: {target} {op}= {val}')
                 except Exception:
                     pass
-            # Regular assign with numeric literal (flag/counter reset)
             elif isinstance(node, ast.Assign):
                 try:
                     for t in node.targets:
@@ -794,7 +771,6 @@ class ExecutionPredictor:
                     pass
 
     def _extract_exceptions(self, tree: ast.AST, results: List):
-        """Detect raise statements and risky patterns."""
         for node in ast.walk(tree):
             if isinstance(node, ast.Raise):
                 try:
@@ -804,7 +780,6 @@ class ExecutionPredictor:
                         results.append('Re-raises current exception')
                 except Exception:
                     pass
-            # Detect division — potential ZeroDivisionError
             elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
                 try:
                     if isinstance(node.right, ast.Constant) and node.right.value == 0:
@@ -820,11 +795,6 @@ class ExecutionPredictor:
 # ============================================================================
 
 class BehaviorSimulator:
-    """
-    Compares old_code vs new_code behavior at semantic level.
-    Detects behavioral changes without executing code.
-    """
-
     def compare(self, old_code: str, new_code: str) -> Dict[str, Any]:
         if not old_code.strip():
             return {
@@ -848,7 +818,6 @@ class BehaviorSimulator:
         changes = []
         behavior_score = 100
 
-        # Compare return values
         old_returns = self._get_return_values(old_tree)
         new_returns = self._get_return_values(new_tree)
         if old_returns != new_returns:
@@ -862,7 +831,6 @@ class BehaviorSimulator:
                 })
                 behavior_score -= 20
 
-        # Compare assignments (key variable values)
         old_assigns = self._get_key_assignments(old_tree)
         new_assigns = self._get_key_assignments(new_tree)
         for var in set(old_assigns) & set(new_assigns):
@@ -874,7 +842,6 @@ class BehaviorSimulator:
                 })
                 behavior_score -= 10
 
-        # Compare conditions
         old_conds = self._get_conditions(old_tree)
         new_conds = self._get_conditions(new_tree)
         added_conds = [c for c in new_conds if c not in old_conds]
@@ -889,7 +856,6 @@ class BehaviorSimulator:
             })
             behavior_score -= 15
 
-        # Compare function signatures
         old_sigs = self._get_function_signatures(old_tree)
         new_sigs = self._get_function_signatures(new_tree)
         for func in set(old_sigs) & set(new_sigs):
@@ -962,7 +928,7 @@ class BehaviorSimulator:
 
 
 # ============================================================================
-# LAYER 1 — CHANGE ANALYZER (unchanged from v5)
+# LAYER 1 — CHANGE ANALYZER
 # ============================================================================
 
 class ChangeAnalyzer:
@@ -977,8 +943,6 @@ class ChangeAnalyzer:
             old_ast = safe_ast(old)
             new_ast = safe_ast(new)
         except ValueError as e:
-            # Syntax errors in either version must be an immediate FAIL.
-            # risk=100 → normalize→100 → get_status→"FAIL" → blocks build.
             return [AnalyzerResult(
                 name="SyntaxError",
                 findings=[f"Code contains a syntax error and cannot be analysed: {str(e)}"],
@@ -1130,10 +1094,6 @@ class ChangeAnalyzer:
         if ('Lt' in old_compare and 'LtE' in new_compare) or ('LtE' in old_compare and 'Lt' in new_compare):
             boundary_changes.append('< ↔ <='); risk = max(risk, 40)
 
-        # ── UnaryOp comparator detection ─────────────────────────────────────
-        # Catches obfuscated boundary changes like  age >+ 18  (parsed as age > +18)
-        # which looks like a boundary shift but uses a unary-modified comparator.
-        # Compare both the operator change AND whether a UnaryOp appeared/disappeared.
         try:
             old_t = safe_ast(old_code)
             new_t = safe_ast(new_code)
@@ -1148,12 +1108,11 @@ class ChangeAnalyzer:
                 for c in node.comparators
             )
             if new_has_unary_cmp and not old_has_unary_cmp:
-                # e.g. old: >= 18  →  new: >+ 18 (Gt + UnaryOp)
                 boundary_changes.append('UnaryOp-obfuscated boundary (e.g. >+/>-)'); risk = max(risk, 40)
             elif old_has_unary_cmp and not new_has_unary_cmp:
                 boundary_changes.append('UnaryOp comparator removed'); risk = max(risk, 40)
         except (ValueError, Exception):
-            pass  # safe_ast failure already handled upstream
+            pass
 
         if boundary_changes:
             findings.append(AnalyzerResult(
@@ -1324,7 +1283,7 @@ class ChangeAnalyzer:
 
 
 # ============================================================================
-# COMPLIANCE ANALYZER (unchanged from v5)
+# COMPLIANCE ANALYZER
 # ============================================================================
 
 class ComplianceAnalyzer:
@@ -1332,7 +1291,6 @@ class ComplianceAnalyzer:
         try:
             tree = safe_ast(code)
         except ValueError as e:
-            # Syntax errors must be an immediate FAIL — not a low-risk pass.
             return [AnalyzerResult(
                 name="SyntaxError",
                 findings=[f"Code contains a syntax error and cannot be analysed: {str(e)}"],
@@ -1391,10 +1349,6 @@ class ComplianceAnalyzer:
 # ============================================================================
 
 def compute_overall_score(risk_score: int, quality_score: int, security_score: int, behavior_score: int) -> int:
-    """
-    Weighted combination of all four scores.
-    risk_score: inverted (100 - risk) = safety score
-    """
     safety = max(0, 100 - risk_score)
     overall = int(
         safety * 0.30 +
@@ -1492,11 +1446,6 @@ def semantic_explanation_prompt(old_code: str, new_code: str, findings: List, ri
                                 quality_score: int, security_score: int,
                                 hashes: Optional[Dict] = None,
                                 execution_prediction: Optional[Dict] = None) -> str:
-    """
-    v7 enriched prompt — passes all structured context so AI can give
-    technical_explanation, human_explanation, risk_reasoning, behavioral_impact.
-    AI must NOT influence risk score.
-    """
     hash_block = ""
     if hashes:
         hash_block = f"""
@@ -1517,7 +1466,7 @@ Execution Prediction (AST-simulated, confidence {conf}):
   Exception risks  : {exc}
 """
 
-    return f"""You are CRONOS v7 — an enterprise static analysis intelligence engine.
+    return f"""You are CRONOS v8 — an enterprise static analysis intelligence engine.
 Your role is EXPLANATION ONLY. You must NOT change or influence any numeric score.
 
 STRUCTURED CONTEXT:
@@ -1544,12 +1493,7 @@ Respond with EXACTLY this JSON structure (no markdown, no extra keys):
 
 
 def parse_ai_explanation(raw: str) -> Dict[str, str]:
-    """
-    Parse the structured JSON the AI is asked to return.
-    Falls back to putting the whole response in technical_explanation.
-    """
     try:
-        # Strip markdown fences if present
         clean = raw.strip()
         if clean.startswith("```"):
             clean = "\n".join(clean.split("\n")[1:])
@@ -1571,34 +1515,20 @@ def parse_ai_explanation(raw: str) -> Dict[str, str]:
         }
 
 
-
-
 # ============================================================================
-# FULL ANALYSIS RUNNER — v7 (async + parallel + hash cache)
+# FULL ANALYSIS RUNNER — v8 (async + parallel + hash cache)
 # ============================================================================
 
 async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") -> Dict[str, Any]:
-    """
-    Enterprise-grade full analysis.
-    Steps:
-      1. Hash generation (old_hash, new_hash, semantic_hash)
-      2. Hash cache check — return cached result if AST is identical
-      3. Parallel execution: all AST layers run simultaneously via asyncio.gather
-      4. AI explanation with full structured context (hashes + execution_prediction)
-      5. Store result in REPORT_STORE + disk
-    Target: < 800 ms
-    """
     loop = asyncio.get_event_loop()
     report_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().isoformat() + "Z"
 
-    # ── STEP 1: Hash generation ──────────────────────────────────────────────
     hashes        = compute_hashes(old_code, new_code)
     old_hash      = hashes["old_hash"]
     new_hash      = hashes["new_hash"]
     semantic_hash = hashes["semantic_hash"]
 
-    # ── STEP 2: Hash cache check ─────────────────────────────────────────────
     cache_key = f"{semantic_hash}:{mode}"
     if cache_key in HASH_CACHE:
         cached = HASH_CACHE[cache_key].copy()
@@ -1609,7 +1539,6 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
         _persist_report(report_id, cached)
         return cached
 
-    # ── STEP 3: Build constraints ─────────────────────────────────────────────
     if mode == "STRICT":
         constraints = Constraint(no_behavior_change=True, allow_boundary_change=False)
     elif mode == "BOUNDARY":
@@ -1617,7 +1546,6 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
     else:
         constraints = Constraint(no_behavior_change=False, allow_boundary_change=False)
 
-    # ── STEP 4: Parallel AST analysis ────────────────────────────────────────
     def _run_risk():
         if old_code.strip():
             return ChangeAnalyzer().analyze(old_code, new_code, constraints)
@@ -1656,7 +1584,6 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
     overall_score  = compute_overall_score(raw_risk, quality_score, security_score, behavior_score)
     risk_summary   = [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No risk issues detected"]
 
-    # ── STEP 5: AI explanation ────────────────────────────────────────────────
     exec_pred_for_ai = {
         "possible_outputs": execution_prediction.get("possible_outputs", []),
         "exceptions":       execution_prediction.get("exceptions", []),
@@ -1682,27 +1609,22 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
         }
         ai_provider = "None"
 
-    # ── STEP 6: Assemble result ───────────────────────────────────────────────
     result = {
-        # Core / backward-compatible
         "status":     status,
         "risk":       risk_score,
         "risk_score": risk_score,
-        "severity":   compute_severity(risk_score),   # ← NEW: required by action severity gate
+        "severity":   compute_severity(risk_score),
         "mode":       mode,
 
-        # Intelligence scores
         "quality_score":  quality_score,
         "security_score": security_score,
         "overall_score":  overall_score,
         "behavior_score": behavior_score,
 
-        # Hash triad
         "old_hash":      old_hash,
         "new_hash":      new_hash,
         "semantic_hash": semantic_hash,
 
-        # Execution prediction (enriched)
         "execution_prediction": {
             "possible_outputs": execution_prediction.get("possible_outputs", []),
             "return_values":    execution_prediction.get("return_values", []),
@@ -1715,40 +1637,34 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
             "execution_paths":  execution_prediction.get("execution_paths", 1),
         },
 
-        # Behavior simulation
         "behavior": {
             "changed": behavior.get("changed", False),
             "summary": behavior.get("summary", ""),
             "changes": behavior.get("changes", []),
         },
 
-        # AI explanations (four structured fields)
         "technical_explanation": ai_fields["technical_explanation"],
         "human_explanation":     ai_fields["human_explanation"],
         "risk_reasoning":        ai_fields["risk_reasoning"],
         "behavioral_impact":     ai_fields["behavioral_impact"],
         "ai_provider":           ai_provider,
 
-        # Findings
         "summary":           risk_summary,
         "findings_count":    len(risk_findings),
         "risk_findings":     [f.dict() for f in risk_findings],
         "quality_findings":  quality_issues,
         "security_findings": security_findings,
 
-        # CI/CD gate flags
         "pass": status == "PASS",
         "warn": status == "WARN",
         "fail": status == "FAIL",
 
-        # Metadata
         "metadata":  risk_signals,
         "report_id": report_id,
         "timestamp": timestamp,
         "cache_hit": False,
     }
 
-    # ── STEP 7: Cache + persist ───────────────────────────────────────────────
     HASH_CACHE[cache_key] = result.copy()
     REPORT_STORE[report_id] = result
     _persist_report(report_id, result)
@@ -1757,7 +1673,6 @@ async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") 
 
 
 def _persist_report(report_id: str, data: Dict) -> None:
-    """Write report to disk."""
     try:
         with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -1799,7 +1714,6 @@ def generate_professional_pdf(data: Dict) -> BytesIO:
         c.drawString(0.75*inch, y, item)
         y -= 0.2*inch
 
-    # Hash triad
     old_h = data.get('old_hash', '')
     new_h = data.get('new_hash', '')
     sem_h = data.get('semantic_hash', '')
@@ -1846,7 +1760,6 @@ def generate_professional_pdf(data: Dict) -> BytesIO:
     else:
         c.drawString(0.75*inch, y, "• No issues detected"); y -= 0.3*inch
 
-    # Security findings
     sec_findings = data.get('security_findings', [])
     if sec_findings:
         if y < 3*inch: c.showPage(); y = height - 0.5*inch
@@ -1883,7 +1796,7 @@ def generate_professional_pdf(data: Dict) -> BytesIO:
         if y < 0.5*inch: break
 
     c.setFont("Helvetica-Oblique", 8)
-    c.drawString(0.5*inch, 0.5*inch, "CRONOS v6.0.0 - Advanced Intelligence Code Analysis")
+    c.drawString(0.5*inch, 0.5*inch, "CRONOS v8.0.0 - Advanced Intelligence Code Analysis")
     c.drawString(width - 2*inch, 0.5*inch, "Page 1")
     c.save()
     buffer.seek(0)
@@ -1896,10 +1809,6 @@ def generate_professional_pdf(data: Dict) -> BytesIO:
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
-    """
-    Main analysis endpoint. Supports CHANGE and COMPLIANCE modes.
-    Now additionally returns quality_score, security_score, overall_score.
-    """
     mode = req.mode
     report_id = str(uuid.uuid4())
 
@@ -1917,7 +1826,6 @@ async def analyze(req: AnalyzeRequest):
             risk = normalize_risk(raw_risk)
             status = pass_fail_from_risk(risk)
 
-            # New intelligence layers
             quality_score, quality_issues = CodeQualityAnalyzer().analyze(new_code)
             security_score, security_findings = SecurityAnalyzer().analyze(new_code)
             behavior = BehaviorSimulator().compare(old_code, new_code)
@@ -1939,7 +1847,7 @@ async def analyze(req: AnalyzeRequest):
             result = {
                 "mode": "CHANGE",
                 "status": status,
-                "severity": compute_severity(risk),   # ← NEW
+                "severity": compute_severity(risk),
                 "risk_score": risk,
                 "quality_score": quality_score,
                 "security_score": security_score,
@@ -1980,7 +1888,7 @@ async def analyze(req: AnalyzeRequest):
             result = {
                 "mode": "COMPLIANCE",
                 "status": status,
-                "severity": compute_severity(risk),   # ← NEW
+                "severity": compute_severity(risk),
                 "risk_score": risk,
                 "quality_score": quality_score,
                 "security_score": security_score,
@@ -2024,7 +1932,6 @@ async def analyze_ci_get():
 
 @app.post("/analyze_ci")
 async def analyze_ci(request: Request):
-    """CI/CD optimized endpoint. Now includes quality_score, security_score, overall_score."""
     try:
         body = await request.json()
     except Exception:
@@ -2068,7 +1975,6 @@ async def analyze_ci(request: Request):
         risk = normalize_risk(raw_risk)
         status = get_status(risk)
 
-        # New: quality and security
         quality_score, _ = CodeQualityAnalyzer().analyze(new_code)
         security_score, _ = SecurityAnalyzer().analyze(new_code)
         behavior = BehaviorSimulator().compare(old_code, new_code)
@@ -2079,7 +1985,7 @@ async def analyze_ci(request: Request):
         response = {
             "risk": risk,
             "status": status,
-            "severity": compute_severity(risk),   # ← NEW
+            "severity": compute_severity(risk),
             "mode": mode,
             "findings_count": len(findings),
             "summary": summary,
@@ -2112,21 +2018,6 @@ async def analyze_ci(request: Request):
 
 @app.post("/analyze_full")
 async def analyze_full(req: FullAnalyzeRequest):
-    """
-    Full 5-layer enterprise intelligence report.
-
-    v7 upgrades:
-    - Returns old_hash, new_hash, semantic_hash
-    - Parallel async execution (target < 800 ms)
-    - Hash cache: identical AST → instant cached response
-    - Four structured AI fields: technical_explanation, human_explanation,
-      risk_reasoning, behavioral_impact
-    - execution_prediction includes state_changes + exceptions
-    - Result stored in REPORT_STORE (memory) + disk
-
-    Input:  { "old_code": "...", "new_code": "...", "mode": "STRICT|BOUNDARY|CONTRACT" }
-    Output: full intelligence report (see schema above)
-    """
     try:
         result = await run_full_analysis(req.old_code, req.new_code, req.mode)
         return result
@@ -2136,13 +2027,8 @@ async def analyze_full(req: FullAnalyzeRequest):
 
 @app.get("/report/store/{report_id}")
 async def get_report_from_store(report_id: str):
-    """
-    Instant in-memory report retrieval (faster than disk read).
-    Falls back to disk if not in memory store.
-    """
     if report_id in REPORT_STORE:
         return JSONResponse(content=REPORT_STORE[report_id])
-    # Fallback to disk
     path = f"{REPORT_DIR}/{report_id}.json"
     if os.path.exists(path):
         with open(path, encoding='utf-8') as f:
@@ -2181,7 +2067,8 @@ async def download_pdf(report_id: str):
 async def health():
     return {
         "status": "ok",
-        "service": "CRONOS v6.0.0 — Advanced Intelligence Code Analyzer",
+        # BUG FIX 4: version string now matches FastAPI(..., version="8.0.0") above
+        "service": "CRONOS v8.0.0 — Advanced Intelligence Code Analyzer",
         "description": "SonarQube + GitHub Advanced Security + Semantic Execution Predictor",
         "intelligence_layers": {
             "layer_1": "Static Risk Analysis (AST-based change detection)",
@@ -2218,7 +2105,8 @@ async def health():
 @app.on_event("startup")
 async def startup_event():
     print("=" * 80)
-    print("✅ CRONOS v6.0.0 — ADVANCED INTELLIGENCE CODE ANALYZER")
+    # BUG FIX 4: startup banner now consistent with version="8.0.0"
+    print("✅ CRONOS v8.0.0 — ADVANCED INTELLIGENCE CODE ANALYZER")
     print("=" * 80)
     print(f"📁 Report directory: {REPORT_DIR}")
     print(f"🤖 Gemini: {'✅ Enabled' if gemini_model else '❌ Disabled'}")
