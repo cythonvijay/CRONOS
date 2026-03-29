@@ -859,17 +859,11 @@ def _call_gemini(prompt: str) -> Tuple[str, str]:
         raise Exception("GEMINI_API_KEY not set")
 
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 700
-        }
+            "maxOutputTokens": 700,
+        },
     }
 
     resp = requests.post(
@@ -883,10 +877,9 @@ def _call_gemini(prompt: str) -> Tuple[str, str]:
         raise Exception(f"Gemini error {resp.status_code}: {resp.text}")
 
     data = resp.json()
-
     return (
         data["candidates"][0]["content"]["parts"][0]["text"],
-        "Gemini"
+        "Gemini",
     )
 
 
@@ -897,13 +890,13 @@ def _call_openrouter(prompt: str) -> Tuple[str, str]:
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
         json={
             "model": "deepseek/deepseek-chat",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 700
+            "max_tokens": 700,
         },
         timeout=30,
     )
@@ -948,7 +941,7 @@ class AIExplainer:
             f.findings[0] for f in findings[:5]
         ) if findings else "No specific findings"
 
-        exec_outputs = exec_summary.get("possible_outputs", [])
+        exec_outputs    = exec_summary.get("possible_outputs", [])
         exec_exceptions = exec_summary.get("exceptions", [])
         exec_confidence = exec_summary.get("confidence", 0)
 
@@ -980,10 +973,6 @@ Do not include markdown, code blocks, or extra keys."""
             raw, provider = _ai(prompt)
             parsed = self._parse_json(raw)
             return {
-                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, mode)),
-                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, mode)),
-                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, quality_score, security_score)),
-                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
                 "technical_explanation": parsed.get("technical_explanation") or self._fallback_tech(risk_score, findings_text, mode),
                 "human_explanation":     parsed.get("human_explanation")     or self._fallback_human(risk_score, mode),
                 "risk_reasoning":        parsed.get("risk_reasoning")        or self._fallback_reason(risk_score, quality_score, security_score),
@@ -1026,10 +1015,6 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
             raw, provider = _ai(prompt)
             parsed = self._parse_json(raw)
             return {
-                "technical_explanation": parsed.get("technical_explanation", self._fallback_tech(risk_score, findings_text, "REALTIME")),
-                "human_explanation":     parsed.get("human_explanation",     self._fallback_human(risk_score, "REALTIME")),
-                "risk_reasoning":        parsed.get("risk_reasoning",        self._fallback_reason(risk_score, 100, security_score)),
-                "behavioral_impact":     parsed.get("behavioral_impact",     self._fallback_impact(findings_text)),
                 "technical_explanation": parsed.get("technical_explanation") or self._fallback_tech(risk_score, findings_text, "REALTIME"),
                 "human_explanation":     parsed.get("human_explanation")     or self._fallback_human(risk_score, "REALTIME"),
                 "risk_reasoning":        parsed.get("risk_reasoning")        or self._fallback_reason(risk_score, 100, security_score),
@@ -1041,8 +1026,8 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
             return self._safe_defaults(risk_score, 100, security_score, findings_text, "REALTIME")
 
     def _parse_json(self, raw: str) -> Dict:
-        """Parse AI JSON response robustly — strips markdown fences."""
-        """Parse AI JSON response robustly — strips markdown fences.
+        """
+        Parse AI JSON response robustly — strips markdown fences.
         Returns {} if parsing fails OR if all 4 required keys are empty strings,
         so that callers using `or` fall through to deterministic fallbacks.
         """
@@ -1051,28 +1036,28 @@ Each value: 1-2 sentences. No markdown, no extra keys."""
         text = raw.strip()
         # Strip markdown code fences
         text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'\s*```$',          '', text, flags=re.MULTILINE)
         text = text.strip()
 
         parsed = {}
         try:
-            return json.loads(text)
             parsed = json.loads(text)
         except json.JSONDecodeError:
             # Attempt to extract first {...} block
             m = re.search(r'\{.*\}', text, re.DOTALL)
             if m:
                 try:
-                    return json.loads(m.group(0))
                     parsed = json.loads(m.group(0))
-                except:
+                except Exception:
                     pass
-        return {}
 
-        # If Gemini returned the JSON skeleton with empty values, discard it
+        if not parsed:
+            return {}
+
+        # If AI returned the JSON skeleton with all-empty values, discard it
         # so the `or fallback()` pattern in callers activates correctly.
         REQUIRED = ("technical_explanation", "human_explanation", "risk_reasoning", "behavioral_impact")
-        if parsed and all(not parsed.get(k, "").strip() for k in REQUIRED):
+        if all(not str(parsed.get(k, "")).strip() for k in REQUIRED):
             print("⚠️ AI returned empty-valued JSON — using deterministic fallbacks")
             return {}
 
@@ -1210,7 +1195,7 @@ class PRCommentFormatter:
             "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
         }
-        url  = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
         try:
             resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
             if resp.status_code in (200, 201):
@@ -1407,7 +1392,6 @@ async def run_full_analysis(
             "old_hash":        old_hash,
             "new_hash":        new_hash,
             "semantic_hash":   semantic_hash,
-            # Cached responses still include placeholder explanations
             "technical_explanation": f"[{mode}] Cached result. Risk: {scores['risk_score']}/100, Severity: {scores['severity']}.",
             "human_explanation":     f"[{mode}] This analysis was retrieved from cache based on matching semantic hash.",
             "risk_reasoning":        f"Risk score {scores['risk_score']} from previous identical analysis.",
@@ -1474,6 +1458,8 @@ async def run_full_analysis(
     severity       = RiskEngine.classify_severity(risk_score, security_score, behavior.get("changed", False), exec_pred)
 
     # 5. AI explanation — always runs, never crashes pipeline
+    findings_text = "; ".join(f.findings[0] for f in risk_findings[:3]) if risk_findings else "No findings"
+
     def _explain():
         return _ai_ex.explain(
             old_code, new_code, risk_findings, risk_score,
@@ -1503,15 +1489,11 @@ async def run_full_analysis(
         "old_hash":      old_hash,
         "new_hash":      new_hash,
         "semantic_hash": semantic_hash,
-        # Full AI explanations always present
-        "technical_explanation": ai_fields.get("technical_explanation", ""),
-        "human_explanation":     ai_fields.get("human_explanation", ""),
-        "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
-        "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
-        "technical_explanation": ai_fields.get("technical_explanation") or _ai_ex._fallback_tech(risk_score, "; ".join(f.findings[0] for f in risk_findings[:3]) if risk_findings else "No findings", mode),
+        # Full AI explanations — always present, fall back to deterministic if AI returned empty
+        "technical_explanation": ai_fields.get("technical_explanation") or _ai_ex._fallback_tech(risk_score, findings_text, mode),
         "human_explanation":     ai_fields.get("human_explanation")     or _ai_ex._fallback_human(risk_score, mode),
         "risk_reasoning":        ai_fields.get("risk_reasoning")        or _ai_ex._fallback_reason(risk_score, quality_score, security_score),
-        "behavioral_impact":     ai_fields.get("behavioral_impact")     or _ai_ex._fallback_impact("; ".join(f.findings[0] for f in risk_findings[:3]) if risk_findings else "No findings"),
+        "behavioral_impact":     ai_fields.get("behavioral_impact")     or _ai_ex._fallback_impact(findings_text),
         "ai_provider":           ai_fields.get("ai_provider", "None"),
         # Execution prediction
         "execution_prediction": {
@@ -1532,10 +1514,10 @@ async def run_full_analysis(
             "changes": behavior.get("changes", []),
         },
         # Findings
-        "summary":          [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No issues"],
-        "findings_count":   len(risk_findings),
-        "risk_findings":    [f.dict() for f in risk_findings],
-        "quality_findings": quality_issues,
+        "summary":           [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No issues"],
+        "findings_count":    len(risk_findings),
+        "risk_findings":     [f.dict() for f in risk_findings],
+        "quality_findings":  quality_issues,
         "security_findings": sec_findings,
         # Gate flags
         "pass": status == "PASS",
@@ -2028,20 +2010,20 @@ async def health():
             "feature_6": "IDE Plugin Support (POST /analyze_realtime)",
         },
         "endpoints": {
-            "POST /analyze_full":      "Full 6-layer enterprise intelligence (all 4 AI explanations)",
-            "POST /analyze_realtime":  "IDE plugin — sub-2s analysis",
-            "POST /analyze":           "Advanced analysis (CHANGE/COMPLIANCE)",
-            "POST /analyze_ci":        "CI/CD fast gate",
-            "POST /github/pr_comment": "Post PR intelligence comment",
-            "POST /github/check_run":  "Create Check Run with annotations",
-            "GET  /history/{repo}":    "Historical reports",
-            "GET  /trend/{repo}":      "Trend data for dashboard",
-            "GET  /dashboard/summary": "Dashboard summary",
-            "GET  /dashboard/recent":  "Recent reports",
+            "POST /analyze_full":        "Full 6-layer enterprise intelligence (all 4 AI explanations)",
+            "POST /analyze_realtime":    "IDE plugin — sub-2s analysis",
+            "POST /analyze":             "Advanced analysis (CHANGE/COMPLIANCE)",
+            "POST /analyze_ci":          "CI/CD fast gate",
+            "POST /github/pr_comment":   "Post PR intelligence comment",
+            "POST /github/check_run":    "Create Check Run with annotations",
+            "GET  /history/{repo}":      "Historical reports",
+            "GET  /trend/{repo}":        "Trend data for dashboard",
+            "GET  /dashboard/summary":   "Dashboard summary",
+            "GET  /dashboard/recent":    "Recent reports",
             "GET  /dashboard/high_risk": "High risk reports",
-            "GET  /report/json/{id}":  "Download JSON report",
-            "GET  /report/pdf/{id}":   "Download PDF report",
-            "GET  /report/store/{id}": "In-memory report retrieval",
+            "GET  /report/json/{id}":    "Download JSON report",
+            "GET  /report/pdf/{id}":     "Download PDF report",
+            "GET  /report/store/{id}":   "In-memory report retrieval",
         },
         "security": {
             "zero_code_retention": True,
