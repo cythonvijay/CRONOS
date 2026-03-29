@@ -8,6 +8,7 @@ import ast
 import hashlib
 import uuid
 import asyncio
+import sqlite3
 import requests
 from datetime import datetime
 from typing import List, Dict, Any, Set, Tuple, Optional
@@ -22,98 +23,117 @@ from pydantic import BaseModel, Field, validator
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-
-try:
-    import google.generativeai as genai
-    _GENAI_AVAILABLE = True
-except ImportError:
-    genai = None
-    _GENAI_AVAILABLE = False
 
 # ============================================================================
 # API KEYS
+# NOTE: google-generativeai SDK intentionally removed.
+# It depends on grpcio, which on Python 3.13 has no pre-built wheel and
+# triggers maturin/Rust compilation — failing on Render's read-only filesystem.
+# Gemini is called via the pure REST API using `requests` (already a dep).
 # ============================================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-if GEMINI_API_KEY and _GENAI_AVAILABLE:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-else:
-    gemini_model = None
-
 OPENROUTER_ENABLED = bool(OPENROUTER_API_KEY)
+
+# Gemini REST endpoint — no SDK, no Rust, no maturin, no compilation needed
+_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+    "/gemini-1.5-flash:generateContent"
+)
 
 # ============================================================================
 # APP SETUP
 # ============================================================================
 
 app = FastAPI(
-    title="CRONOS – Advanced Intelligence Code Analyzer",
+    title="CRONOS — Enterprise Intelligence Code Analyzer",
     version="8.0.0",
-    description="Enterprise-grade Python static analysis: SonarQube + AI Semantic Reasoning + Execution Prediction"
+    description="Enterprise-grade: SonarQube + CodeQL + Snyk + Copilot Intelligence"
 )
 
-# BUG FIX 2: "*" and explicit origins cannot coexist — removed wildcard,
-# kept only the explicit allow-list.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://cronoscodeanalyzer.vercel.app",
-        "http://localhost:3000",
-        "http://localhost:5500",
-        "http://127.0.0.1:5500"
-    ],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
-    max_age=3600
+    max_age=3600,
 )
 
 # ============================================================================
-# STORAGE
+# ZERO CODE RETENTION CONSTANTS
 # ============================================================================
 
 REPORT_DIR = "reports"
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-# In-memory store for instant report retrieval (report_id → result dict)
 REPORT_STORE: Dict[str, Any] = {}
+HASH_CACHE:   Dict[str, Any] = {}
+_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
-# Hash cache: semantic_hash → full analysis result
-# Avoids re-analysing identical AST structure
-HASH_CACHE: Dict[str, Any] = {}
+# ============================================================================
+# ██████╗  █████╗ ████████╗ █████╗ ██████╗  █████╗ ███████╗███████╗
+# ██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝
+# ██║  ██║███████║   ██║   ███████║██████╔╝███████║███████╗█████╗
+# ██║  ██║██╔══██║   ██║   ██╔══██║██╔══██╗██╔══██║╚════██║██╔══╝
+# ██████╔╝██║  ██║   ██║   ██║  ██║██████╔╝██║  ██║███████║███████╗
+# ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝
+# ============================================================================
 
-# Thread pool for running sync analyzers inside async endpoints
-_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+DB_PATH = os.getenv("CRONOS_DB_PATH", "cronos.db")
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db() -> None:
+    with _db_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id             TEXT PRIMARY KEY,
+                repo           TEXT NOT NULL DEFAULT '',
+                file           TEXT NOT NULL DEFAULT '',
+                timestamp      TEXT NOT NULL,
+                risk_score     INTEGER NOT NULL DEFAULT 0,
+                security_score INTEGER NOT NULL DEFAULT 0,
+                overall_score  INTEGER NOT NULL DEFAULT 0,
+                severity       TEXT NOT NULL DEFAULT 'SAFE',
+                old_hash       TEXT NOT NULL DEFAULT '',
+                new_hash       TEXT NOT NULL DEFAULT '',
+                semantic_hash  TEXT NOT NULL DEFAULT '',
+                mode           TEXT NOT NULL DEFAULT 'STRICT',
+                status         TEXT NOT NULL DEFAULT 'PASS'
+            )
+        """)
+        conn.commit()
 
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
 
 class Constraint(BaseModel):
-    no_behavior_change: bool = Field(default=False)
+    no_behavior_change:    bool = Field(default=False)
     allow_boundary_change: bool = Field(default=False)
 
 class AnalyzerResult(BaseModel):
-    name: str
+    name:     str
     findings: List[str]
-    risk: int = Field(..., ge=0, le=100)
-    details: Dict[str, Any] = Field(default_factory=dict)
+    risk:     int = Field(..., ge=0, le=100)
+    details:  Dict[str, Any] = Field(default_factory=dict)
 
 class AnalyzeRequest(BaseModel):
-    mode: str = Field(...)
-    old_code: str = Field(default="")
-    new_code: str = Field(default="")
-    old_condition: str = Field(default="")
-    new_condition: str = Field(default="")
-    source_code: str = Field(default="")
-    expected_output: str = Field(default="")
-    constraints: Constraint = Field(default_factory=Constraint)
-    technical_depth: str = Field(default="balanced", pattern="^(academic|balanced|simple)$")
+    mode:             str   = Field(...)
+    old_code:         str   = Field(default="")
+    new_code:         str   = Field(default="")
+    old_condition:    str   = Field(default="")
+    new_condition:    str   = Field(default="")
+    source_code:      str   = Field(default="")
+    expected_output:  str   = Field(default="")
+    constraints:      Constraint = Field(default_factory=Constraint)
+    technical_depth:  str   = Field(default="balanced", pattern="^(academic|balanced|simple)$")
     enable_deep_analysis: bool = Field(default=False)
 
     @validator('mode')
@@ -122,2014 +142,1775 @@ class AnalyzeRequest(BaseModel):
             raise ValueError("mode must be CHANGE or COMPLIANCE")
         return v.upper()
 
-    def get_old_code(self) -> str:
-        return self.old_code or self.old_condition
-
-    def get_new_code(self) -> str:
-        return self.new_code or self.new_condition
-
-class CIAnalyzeRequest(BaseModel):
-    old_code: str = Field(default="")
-    new_code: str = Field(...)
-    mode: str = Field(default="STRICT")
-
-    @validator('mode')
-    def validate_mode(cls, v):
-        if v.upper() not in ['STRICT', 'BOUNDARY', 'CONTRACT']:
-            return 'STRICT'
-        return v.upper()
+    def get_old_code(self) -> str: return self.old_code or self.old_condition
+    def get_new_code(self) -> str: return self.new_code or self.new_condition
 
 class FullAnalyzeRequest(BaseModel):
     old_code: str = Field(default="")
     new_code: str = Field(...)
-    mode: str = Field(default="STRICT")
+    mode:     str = Field(default="STRICT")
+    repo:     str = Field(default="")
+    file:     str = Field(default="")
 
     @validator('mode')
     def validate_mode(cls, v):
-        if v.upper() not in ['STRICT', 'BOUNDARY', 'CONTRACT']:
-            return 'STRICT'
-        return v.upper()
+        return v.upper() if v.upper() in ['STRICT', 'BOUNDARY', 'CONTRACT'] else 'STRICT'
 
-# ---------------------------------------------------------------------------
-# Hash utility — three hashes used throughout v8
-# ---------------------------------------------------------------------------
+class RealtimeAnalyzeRequest(BaseModel):
+    code:     str = Field(...)
+    filename: str = Field(default="unknown.py")
 
-def compute_hashes(old_code: str, new_code: str) -> Dict[str, str]:
-    old_hash = hashlib.sha256(old_code.encode('utf-8')).hexdigest() if old_code.strip() else ""
-    new_hash = hashlib.sha256(new_code.encode('utf-8')).hexdigest()
+# ============================================================================
+# ██╗  ██╗ █████╗ ███████╗██╗  ██╗    ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗
+# ██║  ██║██╔══██╗██╔════╝██║  ██║    ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██╔════╝
+# ███████║███████║███████╗███████║    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗
+# ██╔══██║██╔══██║╚════██║██╔══██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝
+# ██║  ██║██║  ██║███████║██║  ██║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗
+# ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
+# ============================================================================
 
-    try:
-        tree = ast.parse(new_code)
-        ast_repr = ast.dump(tree, indent=None)
-        semantic_hash = hashlib.sha256(ast_repr.encode('utf-8')).hexdigest()
-    except SyntaxError:
-        semantic_hash = f"UNPARSEABLE:{new_hash}"
-    except Exception:
-        semantic_hash = f"UNPARSEABLE:{new_hash}"
+class HashEngine:
+    """SHA256 + semantic (AST-structural) hashing."""
 
-    return {
-        "old_hash": old_hash,
-        "new_hash": new_hash,
-        "semantic_hash": semantic_hash,
+    @staticmethod
+    def sha256(code: str) -> str:
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def semantic(code: str) -> str:
+        try:
+            tree = ast.parse(code)
+            return hashlib.sha256(ast.dump(tree, indent=None).encode("utf-8")).hexdigest()
+        except Exception:
+            return HashEngine.sha256(code)
+
+    @staticmethod
+    def compute(old_code: str, new_code: str) -> Dict[str, str]:
+        return {
+            "old_hash":      HashEngine.sha256(old_code) if old_code.strip() else "",
+            "new_hash":      HashEngine.sha256(new_code),
+            "semantic_hash": HashEngine.semantic(new_code),
+        }
+
+
+# ============================================================================
+# SEVERITY ENGINE
+# ============================================================================
+
+SEVERITY_CRITICAL = "CRITICAL"
+SEVERITY_HIGH     = "HIGH"
+SEVERITY_MEDIUM   = "MEDIUM"
+SEVERITY_LOW      = "LOW"
+SEVERITY_SAFE     = "SAFE"
+
+class RiskEngine:
+    """Risk scoring, severity classification, security scoring."""
+
+    SEVERITY_EMOJI = {
+        SEVERITY_CRITICAL: "🔴",
+        SEVERITY_HIGH:     "🟠",
+        SEVERITY_MEDIUM:   "🟡",
+        SEVERITY_LOW:      "🔵",
+        SEVERITY_SAFE:     "🟢",
     }
+
+    @staticmethod
+    def normalize(raw: int) -> int:
+        if raw <= 0:   return 0
+        if raw <= 20:  return 20
+        if raw <= 40:  return 40
+        if raw <= 60:  return 60
+        if raw <= 80:  return 80
+        return 100
+
+    @staticmethod
+    def status(risk: int) -> str:
+        if risk <= 20: return "PASS"
+        if risk <= 50: return "WARN"
+        return "FAIL"
+
+    @staticmethod
+    def classify_severity(
+        risk_score: int,
+        security_score: int,
+        behavior_changed: bool,
+        execution_prediction: Dict[str, Any],
+    ) -> str:
+        exceptions     = execution_prediction.get("exceptions", []) if execution_prediction else []
+        exception_risk = len(exceptions) > 0
+
+        if risk_score >= 80 or security_score <= 30:
+            return SEVERITY_CRITICAL
+        if risk_score >= 60 or security_score <= 50 or (behavior_changed and exception_risk):
+            return SEVERITY_HIGH
+        if risk_score >= 40 or security_score <= 70 or behavior_changed:
+            return SEVERITY_MEDIUM
+        if risk_score >= 20 or security_score <= 85:
+            return SEVERITY_LOW
+        return SEVERITY_SAFE
+
+    @staticmethod
+    def overall(risk: int, quality: int, security: int, behavior: int) -> int:
+        safety = max(0, 100 - risk)
+        return max(0, min(100, int(
+            safety   * 0.30 +
+            quality  * 0.25 +
+            security * 0.30 +
+            behavior * 0.15
+        )))
+
 
 # ============================================================================
 # AST UTILITIES
 # ============================================================================
 
-def safe_ast(code: str) -> ast.AST:
+def _safe_ast(code: str) -> ast.AST:
     if not code or not code.strip():
-        raise ValueError("Empty code provided")
+        raise ValueError("Empty code")
     try:
         return ast.parse(code)
     except SyntaxError as e:
-        raise ValueError(f"Syntax Error at line {e.lineno}: {e.msg}")
+        raise ValueError(f"Syntax Error line {e.lineno}: {e.msg}")
     except Exception as e:
-        raise ValueError(f"AST Parse Error: {str(e)}")
+        raise ValueError(f"AST Error: {e}")
 
-def hash_source(code: str) -> str:
-    return hashlib.sha256(code.encode('utf-8')).hexdigest()
+def _hash_src(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
-def extract_identifiers(tree: ast.AST) -> Set[str]:
-    identifiers = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            identifiers.add(node.id)
-    return identifiers
+def _identifiers(tree: ast.AST) -> Set[str]:
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
 
-def extract_function_names(tree: ast.AST) -> Set[str]:
-    functions = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            functions.add(node.name)
-    return functions
+def _functions(tree: ast.AST) -> Set[str]:
+    return {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
 
-def extract_call_graph(tree: ast.AST) -> Dict[str, List[str]]:
-    call_graph = {}
+def _call_graph(tree: ast.AST) -> Dict[str, List[str]]:
+    g = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
-            current_function = node.name
-            call_graph[current_function] = []
-            for child in ast.walk(node):
-                if isinstance(child, ast.Call):
-                    if isinstance(child.func, ast.Name):
-                        call_graph[current_function].append(child.func.id)
-                    elif isinstance(child.func, ast.Attribute):
-                        call_graph[current_function].append(child.func.attr)
-    return call_graph
+            g[node.name] = [
+                (c.func.id if isinstance(c.func, ast.Name) else c.func.attr)
+                for c in ast.walk(node) if isinstance(c, ast.Call)
+                and isinstance(c.func, (ast.Name, ast.Attribute))
+            ]
+    return g
 
-def compute_control_flow_signature(tree: ast.AST) -> Dict[str, int]:
-    signature = {'if': 0, 'for': 0, 'while': 0, 'try': 0, 'with': 0,
-                 'return': 0, 'break': 0, 'continue': 0, 'raise': 0}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.If): signature['if'] += 1
-        elif isinstance(node, ast.For): signature['for'] += 1
-        elif isinstance(node, ast.While): signature['while'] += 1
-        elif isinstance(node, ast.Try): signature['try'] += 1
-        elif isinstance(node, ast.With): signature['with'] += 1
-        elif isinstance(node, ast.Return): signature['return'] += 1
-        elif isinstance(node, ast.Break): signature['break'] += 1
-        elif isinstance(node, ast.Continue): signature['continue'] += 1
-        elif isinstance(node, ast.Raise): signature['raise'] += 1
-    return signature
+def _cf_sig(tree: ast.AST) -> Dict[str, int]:
+    sig = {k: 0 for k in ('if','for','while','try','with','return','break','continue','raise')}
+    for n in ast.walk(tree):
+        t = type(n).__name__.lower()
+        if t in sig: sig[t] += 1
+    return sig
+
 
 # ============================================================================
-# RISK NORMALIZATION
+# INTELLIGENCE ENGINE
 # ============================================================================
 
-def normalize_risk(raw_risk: int) -> int:
-    if raw_risk <= 0: return 0
-    elif raw_risk <= 20: return 20
-    elif raw_risk <= 40: return 40
-    elif raw_risk <= 60: return 60
-    elif raw_risk <= 80: return 80
-    else: return 100
+class IntelligenceEngine:
+    """AST comparison, semantic diff, behavior change detection."""
 
-def pass_fail_from_risk(risk: int) -> str:
-    if risk <= 20: return "PASS"
-    elif risk <= 50: return "WARN"
-    else: return "FAIL"
-
-def get_status(risk: int) -> str:
-    return pass_fail_from_risk(risk)
-
-def compute_severity(risk_score: int) -> str:
-    if risk_score <= 0:   return "SAFE"
-    elif risk_score <= 20: return "LOW"
-    elif risk_score <= 40: return "MEDIUM"
-    elif risk_score <= 60: return "HIGH"
-    else:                  return "CRITICAL"
-
-# ============================================================================
-# LAYER 2 — CODE QUALITY ANALYZER
-# ============================================================================
-
-class CodeQualityAnalyzer:
-    """
-    Detects code quality issues:
-    - Unused variables, dead code, unreachable code
-    - Excessive nesting, function complexity
-    - Long functions (>50 lines), duplicate logic
-    """
-
-    def analyze(self, code: str) -> Tuple[int, List[Dict]]:
-        issues = []
+    def analyze_change(
+        self, old: str, new: str, constraints: Optional[Constraint] = None
+    ) -> Tuple[List[AnalyzerResult], int, Dict[str, Any]]:
+        if constraints is None:
+            constraints = Constraint()
+        if not old.strip() or not new.strip():
+            return [], 0, {"error": "Empty code"}
         try:
-            tree = safe_ast(code)
+            oa = _safe_ast(old); na = _safe_ast(new)
         except ValueError as e:
-            return 0, [{"type": "SyntaxError", "message": f"Code contains a syntax error: {str(e)}", "severity": "critical"}]
+            return [AnalyzerResult(name="ParseError", findings=[str(e)], risk=20)], 20, {}
 
-        # BUG FIX 1: `lines` was referenced but never defined — compute it here
-        # so _detect_complex_functions (which receives it) can use it.
-        lines = code.splitlines()
+        oh = _hash_src(old); nh = _hash_src(new)
+        if oh == nh:
+            return [], 0, {"semantic_diff": False, "old_hash": oh, "new_hash": nh, "ast_changed": False}
 
-        # Unused variables
-        issues.extend(self._detect_unused_variables(tree))
+        ast_changed = ast.dump(oa) != ast.dump(na)
+        on = self._nodes(oa); nn = self._nodes(na)
+        findings: List[AnalyzerResult] = []; risks: List[int] = []; details: Dict = {}
 
-        # Excessive nesting
-        issues.extend(self._detect_excessive_nesting(tree))
+        for fn in (self._ops, self._funcs, self._loops, self._imports, self._types, self._cf, self._scope):
+            r, f, d = fn(old, new, on, nn) if fn == self._ops else fn(on, nn)
+            if r > 0:
+                findings.extend(f); risks.append(r); details.update(d)
 
-        # Function complexity & length
-        issues.extend(self._detect_complex_functions(tree, lines))
+        if ast_changed and not risks:
+            r, f, d = self._structural(oa, na, on, nn)
+            if r > 0:
+                findings.extend(f); risks.append(r); details.update(d)
 
-        # Unreachable code (after return/raise)
-        issues.extend(self._detect_unreachable_code(tree))
+        final = max(risks) if risks else 0
+        orig  = final
 
-        # Duplicate logic patterns
-        issues.extend(self._detect_duplicate_logic(tree))
+        if constraints.no_behavior_change and ast_changed and 0 < final < 60:
+            final = 60
+            findings.append(AnalyzerResult(
+                name="ConstraintViolation",
+                findings=[f"STRICT: behavior changed (orig={orig}, enforced={final})"],
+                risk=60,
+            ))
+        if constraints.allow_boundary_change and details.get("boundary_changes") and final == 10:
+            final = 5
 
-        # Calculate quality score (100 = perfect, deduct per issue)
-        deductions = {
-            "critical": 15,
-            "high": 10,
-            "medium": 5,
-            "low": 2
-        }
-        total_deduction = sum(deductions.get(i.get("severity", "low"), 2) for i in issues)
-        quality_score = max(0, 100 - total_deduction)
-
-        return quality_score, issues
-
-    def _detect_unused_variables(self, tree: ast.AST) -> List[Dict]:
-        issues = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                assigned = set()
-                used = set()
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Assign):
-                        for t in child.targets:
-                            if isinstance(t, ast.Name):
-                                assigned.add(t.id)
-                    elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                        used.add(child.id)
-                unused = assigned - used - {'_'}
-                for var in list(unused)[:3]:
-                    issues.append({
-                        "type": "UnusedVariable",
-                        "message": f"Variable '{var}' in function '{node.name}' is assigned but never used",
-                        "severity": "low",
-                        "function": node.name
-                    })
-        return issues
-
-    def _detect_excessive_nesting(self, tree: ast.AST) -> List[Dict]:
-        issues = []
-
-        def get_depth(node, current=0):
-            max_d = current
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
-                    max_d = max(max_d, get_depth(child, current + 1))
-                else:
-                    max_d = max(max_d, get_depth(child, current))
-            return max_d
-
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                depth = get_depth(node)
-                if depth > 4:
-                    issues.append({
-                        "type": "ExcessiveNesting",
-                        "message": f"Function '{node.name}' has nesting depth of {depth} (max recommended: 4)",
-                        "severity": "medium",
-                        "function": node.name,
-                        "depth": depth
-                    })
-        return issues
-
-    def _detect_complex_functions(self, tree: ast.AST, lines: List[str]) -> List[Dict]:
-        issues = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Cyclomatic complexity
-                complexity = 1
-                for child in ast.walk(node):
-                    if isinstance(child, (ast.If, ast.For, ast.While, ast.ExceptHandler,
-                                          ast.With, ast.Assert, ast.comprehension)):
-                        complexity += 1
-                    elif isinstance(child, ast.BoolOp):
-                        complexity += len(child.values) - 1
-
-                if complexity > 10:
-                    issues.append({
-                        "type": "HighComplexity",
-                        "message": f"Function '{node.name}' has cyclomatic complexity of {complexity} (max: 10)",
-                        "severity": "high",
-                        "function": node.name,
-                        "complexity": complexity
-                    })
-
-                # Long function
-                start = node.lineno
-                end = node.end_lineno if hasattr(node, 'end_lineno') else start
-                length = end - start + 1
-                if length > 50:
-                    issues.append({
-                        "type": "LongFunction",
-                        "message": f"Function '{node.name}' is {length} lines long (max recommended: 50)",
-                        "severity": "medium",
-                        "function": node.name,
-                        "lines": length
-                    })
-        return issues
-
-    def _detect_unreachable_code(self, tree: ast.AST) -> List[Dict]:
-        issues = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                body = node.body
-                for i, stmt in enumerate(body[:-1]):
-                    if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
-                        issues.append({
-                            "type": "UnreachableCode",
-                            "message": f"Unreachable code detected after '{type(stmt).__name__}' in function '{node.name}' at statement {i+1}",
-                            "severity": "medium",
-                            "function": node.name
-                        })
-                        break
-        return issues
-
-    def _detect_duplicate_logic(self, tree: ast.AST) -> List[Dict]:
-        issues = []
-        condition_map = defaultdict(list)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                try:
-                    cond_str = ast.unparse(node.test)
-                    condition_map[cond_str].append(node.lineno if hasattr(node, 'lineno') else 0)
-                except Exception:
-                    pass
-
-        # BUG FIX 5: renamed loop variable from `lines` to `occurrences`
-        # to avoid shadowing the `lines` parameter in the outer analyze() scope.
-        for cond, occurrences in condition_map.items():
-            if len(occurrences) > 1:
-                issues.append({
-                    "type": "DuplicateLogic",
-                    "message": f"Condition '{cond[:60]}' appears {len(occurrences)} times — consider extracting to a function",
-                    "severity": "low",
-                    "lines": occurrences
-                })
-        return issues
-
-
-# ============================================================================
-# LAYER 3 — SECURITY ANALYZER
-# ============================================================================
-
-class SecurityAnalyzer:
-    """
-    Detects security vulnerabilities:
-    - eval/exec usage, pickle.loads, subprocess without validation
-    - Hardcoded passwords/keys, weak hashing, insecure random
-    """
-
-    DANGEROUS_CALLS = {
-        'eval': ('critical', 'eval() executes arbitrary code — remote code execution risk'),
-        'exec': ('critical', 'exec() executes arbitrary code — remote code execution risk'),
-        'compile': ('high', 'compile() can be used to execute arbitrary code'),
-        '__import__': ('high', '__import__() allows dynamic module loading'),
-    }
-
-    DANGEROUS_ATTRS = {
-        'loads': ('pickle', 'critical', 'pickle.loads() can execute arbitrary code during deserialization'),
-        'load': ('pickle', 'high', 'pickle.load() deserializes untrusted data'),
-        'call': ('subprocess', 'high', 'subprocess.call() without shell=False can be exploited'),
-        'Popen': ('subprocess', 'high', 'subprocess.Popen() requires input validation'),
-        'system': ('os', 'high', 'os.system() executes shell commands — injection risk'),
-    }
-
-    WEAK_HASH_FUNCS = {'md5', 'sha1'}
-    INSECURE_RANDOM = {'random', 'randint', 'choice', 'shuffle', 'seed'}
-
-    PASSWORD_PATTERNS = [
-        re.compile(r'(?:password|passwd|pwd|secret|api_key|apikey|token)\s*=\s*["\'][^"\']{4,}["\']', re.IGNORECASE),
-        re.compile(r'(?:password|passwd|pwd|secret)\s*=\s*["\'][^"\']*["\']', re.IGNORECASE),
-    ]
-
-    def analyze(self, code: str) -> Tuple[int, List[Dict]]:
-        findings = []
-        try:
-            tree = safe_ast(code)
-        except ValueError as e:
-            return 100, [{"type": "ParseError", "message": str(e), "severity": "critical"}]
-
-        # AST-based checks
-        findings.extend(self._check_dangerous_calls(tree))
-        findings.extend(self._check_dangerous_attrs(tree))
-        findings.extend(self._check_weak_hashing(tree))
-        findings.extend(self._check_insecure_random(tree))
-        findings.extend(self._check_subprocess(tree))
-
-        # Source-level checks
-        findings.extend(self._check_hardcoded_secrets(code))
-
-        # Compute security score
-        severity_weights = {'critical': 30, 'high': 15, 'medium': 8, 'low': 3}
-        total_penalty = sum(severity_weights.get(f.get('severity', 'low'), 3) for f in findings)
-        security_score = max(0, 100 - total_penalty)
-
-        return security_score, findings
-
-    def _check_dangerous_calls(self, tree: ast.AST) -> List[Dict]:
-        findings = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func_name = None
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                if func_name and func_name in self.DANGEROUS_CALLS:
-                    sev, msg = self.DANGEROUS_CALLS[func_name]
-                    findings.append({
-                        "type": "DangerousFunction",
-                        "message": msg,
-                        "function": func_name,
-                        "severity": sev,
-                        "cwe": "CWE-78" if func_name in ('eval', 'exec') else "CWE-94"
-                    })
-        return findings
-
-    def _check_dangerous_attrs(self, tree: ast.AST) -> List[Dict]:
-        findings = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                attr = node.func.attr
-                if attr in self.DANGEROUS_ATTRS:
-                    lib, sev, msg = self.DANGEROUS_ATTRS[attr]
-                    findings.append({
-                        "type": "DangerousMethod",
-                        "message": msg,
-                        "method": attr,
-                        "severity": sev,
-                        "cwe": "CWE-502" if lib == 'pickle' else "CWE-78"
-                    })
-        return findings
-
-    def _check_weak_hashing(self, tree: ast.AST) -> List[Dict]:
-        findings = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func_str = ""
-                if isinstance(node.func, ast.Attribute):
-                    func_str = node.func.attr.lower()
-                elif isinstance(node.func, ast.Name):
-                    func_str = node.func.id.lower()
-                if func_str in self.WEAK_HASH_FUNCS:
-                    findings.append({
-                        "type": "WeakHashing",
-                        "message": f"Weak hash algorithm '{func_str.upper()}' detected — use SHA-256 or bcrypt for passwords",
-                        "algorithm": func_str,
-                        "severity": "high",
-                        "cwe": "CWE-327"
-                    })
-        return findings
-
-    def _check_insecure_random(self, tree: ast.AST) -> List[Dict]:
-        findings = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func_name = ""
-                if isinstance(node.func, ast.Attribute):
-                    func_name = node.func.attr
-                elif isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                if func_name in self.INSECURE_RANDOM:
-                    # Check if it's from the random module (not secrets)
-                    if isinstance(node.func, ast.Attribute):
-                        if isinstance(node.func.value, ast.Name) and node.func.value.id == 'secrets':
-                            continue
-                    findings.append({
-                        "type": "InsecureRandom",
-                        "message": f"random.{func_name}() is not cryptographically secure — use secrets module for security-sensitive operations",
-                        "function": func_name,
-                        "severity": "medium",
-                        "cwe": "CWE-338"
-                    })
-                    break  # Report once per code block
-        return findings
-
-    def _check_subprocess(self, tree: ast.AST) -> List[Dict]:
-        findings = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                is_subprocess = False
-                if isinstance(node.func, ast.Attribute):
-                    if isinstance(node.func.value, ast.Name) and node.func.value.id == 'subprocess':
-                        is_subprocess = True
-                    elif node.func.attr in ('call', 'run', 'Popen', 'check_output'):
-                        is_subprocess = True
-
-                if is_subprocess:
-                    # Check for shell=True
-                    for kw in node.keywords:
-                        if kw.arg == 'shell' and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-                            findings.append({
-                                "type": "SubprocessShellTrue",
-                                "message": "subprocess called with shell=True — command injection risk. Use shell=False with list arguments",
-                                "severity": "critical",
-                                "cwe": "CWE-78"
-                            })
-        return findings
-
-    def _check_hardcoded_secrets(self, code: str) -> List[Dict]:
-        findings = []
-        for pattern in self.PASSWORD_PATTERNS:
-            matches = pattern.findall(code)
-            for match in matches[:2]:  # Limit to 2 findings
-                findings.append({
-                    "type": "HardcodedSecret",
-                    "message": f"Potential hardcoded credential detected: '{match[:50]}...' — use environment variables",
-                    "severity": "critical",
-                    "cwe": "CWE-798"
-                })
-        return findings
-
-
-# ============================================================================
-# LAYER 4 — EXECUTION OUTCOME PREDICTOR
-# ============================================================================
-
-class ExecutionPredictor:
-    def predict(self, code: str) -> Dict[str, Any]:
-        try:
-            tree = safe_ast(code)
-        except ValueError as e:
-            return {
-                "possible_outputs": ["Parse error — prediction unavailable"],
-                "return_values": [],
-                "print_outputs": [],
-                "branches": [],
-                "state_changes": [],
-                "exceptions": [],
-                "auth_outcomes": [],
-                "confidence": 0.0,
-                "execution_paths": 1,
-                "error": str(e)
-            }
-
-        possible_outputs = []
-        return_values = []
-        branches = []
-        print_outputs = []
-        auth_outcomes = []
-        state_changes = []
-        exceptions = []
-
-        self._extract_returns(tree, return_values)
-        self._extract_prints(tree, print_outputs)
-        self._extract_branches(tree, branches)
-        self._extract_auth_logic(tree, auth_outcomes)
-        self._extract_state_changes(tree, state_changes)
-        self._extract_exceptions(tree, exceptions)
-
-        possible_outputs.extend(return_values[:5])
-        possible_outputs.extend(print_outputs[:3])
-        possible_outputs.extend(auth_outcomes[:3])
-
-        if not possible_outputs:
-            possible_outputs = ["No explicit outputs detected (side-effects only)"]
-
-        total_nodes = sum(1 for _ in ast.walk(tree))
-        analyzable = len(return_values) + len(print_outputs) + len(branches)
-        confidence = min(0.95, 0.5 + (analyzable / max(total_nodes, 1)) * 0.5)
-        confidence = round(confidence, 2)
-
-        return {
-            "possible_outputs": list(dict.fromkeys(possible_outputs)),
-            "return_values": return_values[:8],
-            "print_outputs": print_outputs[:5],
-            "branches": branches[:8],
-            "state_changes": state_changes[:6],
-            "exceptions": exceptions[:5],
-            "auth_outcomes": auth_outcomes,
-            "confidence": confidence,
-            "execution_paths": len(branches) + 1
+        return findings, final, {
+            "semantic_diff": ast_changed, "old_hash": oh, "new_hash": nh,
+            "ast_changed": ast_changed,
+            "categories_analyzed": len([r for r in risks if r > 0]),
+            "total_findings": len(findings),
+            "risk_breakdown": {
+                "operator": 0, "function": 0, "loop": 0,
+                "import": 0, "datatype": 0, "control_flow": 0, "scope": 0,
+            },
+            **details,
         }
 
-    def _extract_returns(self, tree: ast.AST, results: List):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Return) and node.value is not None:
-                try:
-                    val = ast.unparse(node.value)
-                    if isinstance(node.value, ast.Constant):
-                        results.append(f'→ returns: {repr(node.value.value)}')
-                    elif isinstance(node.value, ast.Name):
-                        results.append(f'→ returns variable: {node.value.id}')
-                    elif isinstance(node.value, ast.Dict):
-                        results.append('→ returns: dict object')
-                    elif isinstance(node.value, ast.List):
-                        results.append('→ returns: list object')
-                    else:
-                        results.append(f'→ returns: {val[:60]}')
-                except Exception:
-                    pass
-
-    def _extract_prints(self, tree: ast.AST, results: List):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                func_name = None
-                if isinstance(node.func, ast.Name):
-                    func_name = node.func.id
-                if func_name == 'print' and node.args:
-                    try:
-                        arg = node.args[0]
-                        if isinstance(arg, ast.Constant):
-                            results.append(f'prints: {repr(arg.value)[:60]}')
-                        elif isinstance(arg, ast.JoinedStr):
-                            results.append('prints: f-string (dynamic content)')
-                        else:
-                            results.append(f'prints: {ast.unparse(arg)[:60]}')
-                    except Exception:
-                        pass
-
-    def _extract_branches(self, tree: ast.AST, results: List):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                try:
-                    cond = ast.unparse(node.test)
-                    then_returns = [
-                        ast.unparse(n.value) if n.value else "None"
-                        for n in ast.walk(ast.Module(body=node.body, type_ignores=[]))
-                        if isinstance(n, ast.Return)
-                    ]
-                    else_returns = []
-                    if node.orelse:
-                        else_returns = [
-                            ast.unparse(n.value) if n.value else "None"
-                            for n in ast.walk(ast.Module(body=node.orelse, type_ignores=[]))
-                            if isinstance(n, ast.Return)
-                        ]
-
-                    branch = {
-                        "condition": cond[:80],
-                        "true_path": then_returns[:2] if then_returns else ["continues"],
-                        "false_path": else_returns[:2] if else_returns else ["continues / falls through"]
-                    }
-                    results.append(branch)
-                except Exception:
-                    pass
-
-    def _extract_auth_logic(self, tree: ast.AST, results: List):
-        auth_keywords = {'admin', 'role', 'permission', 'authenticated', 'authorized',
-                         'login', 'logout', 'token', 'access', 'grant', 'deny', 'banned'}
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                try:
-                    cond = ast.unparse(node.test).lower()
-                    if any(kw in cond for kw in auth_keywords):
-                        for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
-                            if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant):
-                                results.append(f'Auth path (if {cond[:40]}): returns {repr(child.value.value)}')
-                        if node.orelse:
-                            for child in ast.walk(ast.Module(body=node.orelse, type_ignores=[])):
-                                if isinstance(child, ast.Return) and isinstance(child.value, ast.Constant):
-                                    results.append(f'Auth fallback: returns {repr(child.value.value)}')
-                except Exception:
-                    pass
-
-    def _extract_state_changes(self, tree: ast.AST, results: List):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AugAssign):
-                try:
-                    target = ast.unparse(node.target)
-                    op = type(node.op).__name__
-                    val = ast.unparse(node.value)
-                    results.append(f'State mutation: {target} {op}= {val}')
-                except Exception:
-                    pass
-            elif isinstance(node, ast.Assign):
-                try:
-                    for t in node.targets:
-                        if isinstance(t, ast.Name) and isinstance(node.value, ast.Constant):
-                            v = node.value.value
-                            if isinstance(v, (int, float, bool)):
-                                results.append(f'State set: {t.id} = {v}')
-                except Exception:
-                    pass
-
-    def _extract_exceptions(self, tree: ast.AST, results: List):
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Raise):
-                try:
-                    if node.exc is not None:
-                        results.append(f'Raises: {ast.unparse(node.exc)[:60]}')
-                    else:
-                        results.append('Re-raises current exception')
-                except Exception:
-                    pass
-            elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
-                try:
-                    if isinstance(node.right, ast.Constant) and node.right.value == 0:
-                        results.append('Risk: division by zero constant detected')
-                    else:
-                        results.append(f'Potential ZeroDivisionError: {ast.unparse(node)[:50]}')
-                except Exception:
-                    pass
-
-
-# ============================================================================
-# LAYER 4b — BEHAVIOR SIMULATOR
-# ============================================================================
-
-class BehaviorSimulator:
-    def compare(self, old_code: str, new_code: str) -> Dict[str, Any]:
-        if not old_code.strip():
-            return {
-                "changed": False,
-                "summary": "No old code provided — baseline comparison unavailable",
-                "changes": [],
-                "behavior_score": 100
-            }
-
+    def analyze_compliance(self, code: str, expected: str) -> Tuple[List[AnalyzerResult], int, Dict[str, Any]]:
         try:
-            old_tree = safe_ast(old_code)
-            new_tree = safe_ast(new_code)
+            tree = _safe_ast(code)
         except ValueError as e:
-            return {
-                "changed": True,
-                "summary": f"Parse error during comparison: {str(e)}",
-                "changes": [],
-                "behavior_score": 50
-            }
+            return [AnalyzerResult(name="ParseError", findings=[str(e)], risk=20)], 20, {}
+        src_hash = _hash_src(code)
+        if not expected.strip():
+            return [], 0, {"semantic_similarity": 1.0, "source_hash": src_hash}
+        idf  = _identifiers(tree); fns = _functions(tree)
+        consts = {str(n.value).lower() for n in ast.walk(tree) if isinstance(n, ast.Constant)}
+        ew   = set(expected.lower().split())
+        wscore = len(fns & ew) * 3.0 + len(idf & ew) * 1.0 + len(consts & ew) * 0.5
+        sim  = min(wscore / max(len(ew) * 3.0, 1), 1.0)
+        risk = (0 if sim >= 0.7 else 20 if sim >= 0.5 else 40 if sim >= 0.3 else 60 if sim >= 0.1 else 80)
+        findings = []
+        if risk > 0:
+            findings.append(AnalyzerResult(
+                name="ContractViolation",
+                findings=[f"Alignment: {sim*100:.1f}%"],
+                risk=risk,
+            ))
+        return findings, risk, {"semantic_similarity": sim, "source_hash": src_hash}
 
-        changes = []
-        behavior_score = 100
+    def compare_behavior(self, old: str, new: str) -> Dict[str, Any]:
+        if not old.strip():
+            return {"changed": False,
+                    "summary": "No old code provided — baseline comparison unavailable",
+                    "changes": [], "behavior_score": 100}
+        try:
+            oa = _safe_ast(old); na = _safe_ast(new)
+        except ValueError as e:
+            return {"changed": True, "summary": f"Parse error: {e}",
+                    "changes": [], "behavior_score": 50}
 
-        old_returns = self._get_return_values(old_tree)
-        new_returns = self._get_return_values(new_tree)
-        if old_returns != new_returns:
-            added = [r for r in new_returns if r not in old_returns]
-            removed = [r for r in old_returns if r not in new_returns]
+        changes = []; score = 100
+
+        # Return values
+        or_ = self._returns(oa); nr_ = self._returns(na)
+        if or_ != nr_:
+            added = [r for r in nr_ if r not in or_]
+            removed = [r for r in or_ if r not in nr_]
             if added or removed:
-                changes.append({
-                    "category": "ReturnValue",
+                changes.append({"category": "ReturnValue",
                     "description": f"Return values changed — removed: {removed[:3]}, added: {added[:3]}",
-                    "impact": "high"
-                })
-                behavior_score -= 20
+                    "impact": "high"})
+                score -= 20
 
-        old_assigns = self._get_key_assignments(old_tree)
-        new_assigns = self._get_key_assignments(new_tree)
-        for var in set(old_assigns) & set(new_assigns):
-            if old_assigns[var] != new_assigns[var]:
-                changes.append({
-                    "category": "VariableValue",
-                    "description": f"Variable '{var}' value changed: {old_assigns[var]} → {new_assigns[var]} — may alter runtime behavior",
-                    "impact": "medium"
-                })
-                behavior_score -= 10
+        # FIX 7: Variable value changes (e.g. x=5 → x=10)
+        oa_ = self._key_assigns(oa); na_ = self._key_assigns(na)
+        for var in set(oa_) & set(na_):
+            if oa_[var] != na_[var]:
+                changes.append({"category": "VariableValue",
+                    "description": f"Variable '{var}' changed: {oa_[var]} → {na_[var]} — may alter runtime behavior",
+                    "impact": "medium"})
+                score -= 10
 
-        old_conds = self._get_conditions(old_tree)
-        new_conds = self._get_conditions(new_tree)
-        added_conds = [c for c in new_conds if c not in old_conds]
-        removed_conds = [c for c in old_conds if c not in new_conds]
-        if added_conds or removed_conds:
-            changes.append({
-                "category": "ControlFlow",
-                "description": f"Conditions changed — may alter execution paths",
-                "removed": removed_conds[:3],
-                "added": added_conds[:3],
-                "impact": "high"
-            })
-            behavior_score -= 15
+        # Conditions
+        oc = self._conds(oa); nc = self._conds(na)
+        added_c = [c for c in nc if c not in oc]
+        removed_c = [c for c in oc if c not in nc]
+        if added_c or removed_c:
+            changes.append({"category": "ControlFlow",
+                "description": "Conditions changed — may alter execution paths",
+                "removed": removed_c[:3], "added": added_c[:3], "impact": "high"})
+            score -= 15
 
-        old_sigs = self._get_function_signatures(old_tree)
-        new_sigs = self._get_function_signatures(new_tree)
-        for func in set(old_sigs) & set(new_sigs):
-            if old_sigs[func] != new_sigs[func]:
-                changes.append({
-                    "category": "FunctionSignature",
-                    "description": f"Function '{func}' signature changed: {old_sigs[func]} → {new_sigs[func]}",
-                    "impact": "high"
-                })
-                behavior_score -= 20
-
-        behavior_changed = len(changes) > 0
-        behavior_score = max(0, behavior_score)
-
-        if changes:
-            summary_parts = [c['description'] for c in changes[:3]]
-            summary = "; ".join(summary_parts)
-        else:
-            summary = "No behavioral changes detected — functionally equivalent code"
+        # Function signatures
+        os_ = self._sigs(oa); ns_ = self._sigs(na)
+        for fn in set(os_) & set(ns_):
+            if os_[fn] != ns_[fn]:
+                changes.append({"category": "FunctionSignature",
+                    "description": f"Function '{fn}' signature changed: {os_[fn]} → {ns_[fn]}",
+                    "impact": "high"})
+                score -= 20
 
         return {
-            "changed": behavior_changed,
-            "summary": summary,
+            "changed": bool(changes),
+            "summary": "; ".join(c["description"] for c in changes[:3]) or "No behavioral changes detected — functionally equivalent code",
             "changes": changes,
-            "behavior_score": behavior_score
+            "behavior_score": max(0, score),
         }
 
-    def _get_return_values(self, tree: ast.AST) -> List[str]:
-        results = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Return):
-                try:
-                    results.append(ast.unparse(node.value) if node.value else "None")
-                except Exception:
-                    pass
-        return results
-
-    def _get_key_assignments(self, tree: ast.AST) -> Dict[str, str]:
+    def _key_assigns(self, tree: ast.AST) -> Dict[str, str]:
+        """Extract key variable assignments for behavioral comparison."""
         assigns = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name):
-                        try:
-                            assigns[target.id] = ast.unparse(node.value)
-                        except Exception:
-                            pass
+                        try: assigns[target.id] = ast.unparse(node.value)
+                        except: pass
         return assigns
-
-    def _get_conditions(self, tree: ast.AST) -> List[str]:
-        conds = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.If):
-                try:
-                    conds.append(ast.unparse(node.test))
-                except Exception:
-                    pass
-        return conds
-
-    def _get_function_signatures(self, tree: ast.AST) -> Dict[str, str]:
-        sigs = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                try:
-                    args = [arg.arg for arg in node.args.args]
-                    sigs[node.name] = str(args)
-                except Exception:
-                    pass
-        return sigs
-
-
-# ============================================================================
-# LAYER 1 — CHANGE ANALYZER
-# ============================================================================
-
-class ChangeAnalyzer:
-    def analyze(self, old: str, new: str, constraints: Optional[Constraint] = None) -> Tuple[List[AnalyzerResult], int, Dict[str, Any]]:
-        if constraints is None:
-            constraints = Constraint()
-
-        if not old.strip() or not new.strip():
-            return [], 0, {"error": "Empty code provided"}
-
-        try:
-            old_ast = safe_ast(old)
-            new_ast = safe_ast(new)
-        except ValueError as e:
-            return [AnalyzerResult(
-                name="SyntaxError",
-                findings=[f"Code contains a syntax error and cannot be analysed: {str(e)}"],
-                risk=100,
-                details={"error": str(e), "parse_error": True, "syntax_error": True}
-            )], 100, {"parse_error": True, "syntax_error": True}
-
-        old_hash = hash_source(old)
-        new_hash = hash_source(new)
-
-        if old_hash == new_hash:
-            return [], 0, {"semantic_diff": False, "old_hash": old_hash, "new_hash": new_hash, "ast_changed": False, "conclusion": "No changes detected"}
-
-        old_ast_dump = ast.dump(old_ast)
-        new_ast_dump = ast.dump(new_ast)
-        ast_changed = old_ast_dump != new_ast_dump
-
-        old_nodes = self._extract_node_types(old_ast)
-        new_nodes = self._extract_node_types(new_ast)
-
-        findings: List[AnalyzerResult] = []
-        risk_scores: List[int] = []
-        change_details: Dict[str, Any] = {}
-
-        operator_risk, operator_findings, operator_details = self._analyze_operators(old, new, old_nodes, new_nodes)
-        if operator_risk > 0:
-            findings.extend(operator_findings); risk_scores.append(operator_risk); change_details.update(operator_details)
-
-        function_risk, function_findings, function_details = self._analyze_functions(old_nodes, new_nodes)
-        if function_risk > 0:
-            findings.extend(function_findings); risk_scores.append(function_risk); change_details.update(function_details)
-
-        loop_risk, loop_findings, loop_details = self._analyze_loops(old_nodes, new_nodes)
-        if loop_risk > 0:
-            findings.extend(loop_findings); risk_scores.append(loop_risk); change_details.update(loop_details)
-
-        import_risk, import_findings, import_details = self._analyze_imports(old_nodes, new_nodes)
-        if import_risk > 0:
-            findings.extend(import_findings); risk_scores.append(import_risk); change_details.update(import_details)
-
-        datatype_risk, datatype_findings, datatype_details = self._analyze_datatypes(old_nodes, new_nodes)
-        if datatype_risk > 0:
-            findings.extend(datatype_findings); risk_scores.append(datatype_risk); change_details.update(datatype_details)
-
-        control_risk, control_findings, control_details = self._analyze_control_flow(old_nodes, new_nodes)
-        if control_risk > 0:
-            findings.extend(control_findings); risk_scores.append(control_risk); change_details.update(control_details)
-
-        scope_risk, scope_findings, scope_details = self._analyze_variable_scope(old_nodes, new_nodes)
-        if scope_risk > 0:
-            findings.extend(scope_findings); risk_scores.append(scope_risk); change_details.update(scope_details)
-
-        if ast_changed and not risk_scores:
-            structural_risk, structural_findings, structural_details = self._analyze_structural(old_ast, new_ast, old_nodes, new_nodes)
-            if structural_risk > 0:
-                findings.extend(structural_findings); risk_scores.append(structural_risk); change_details.update(structural_details)
-
-        final_risk = max(risk_scores) if risk_scores else 0
-        original_risk = final_risk
-
-        if constraints.no_behavior_change:
-            if ast_changed and final_risk > 0:
-                if final_risk < 60:
-                    final_risk = 60
-                    findings.append(AnalyzerResult(
-                        name="ConstraintViolation",
-                        findings=[f"STRICT MODE VIOLATION: no_behavior_change=True but semantic changes detected (original risk: {original_risk}, enforced: {final_risk})"],
-                        risk=60,
-                        details={"constraint": "no_behavior_change", "violated": True, "original_risk": original_risk, "enforced_risk": final_risk}
-                    ))
-
-        if constraints.allow_boundary_change and change_details.get('boundary_changes'):
-            if not constraints.no_behavior_change or final_risk == original_risk:
-                if final_risk == 10:
-                    final_risk = 5
-
-        signals = {
-            "semantic_diff": ast_changed, "old_hash": old_hash, "new_hash": new_hash,
-            "ast_changed": ast_changed, "old_code": old, "new_code": new,
-            "categories_analyzed": len([r for r in risk_scores if r > 0]),
-            "total_findings": len(findings),
-            "risk_breakdown": {
-                "operator": operator_risk, "function": function_risk, "loop": loop_risk,
-                "import": import_risk, "datatype": datatype_risk, "control_flow": control_risk, "scope": scope_risk
-            },
-            **change_details
-        }
-
-        return findings, final_risk, signals
-
-    def _extract_node_types(self, tree: ast.AST) -> Dict[str, Any]:
-        nodes = {
+    # ── Node type extraction ─────────────────────────────────────────────────
+    def _nodes(self, tree: ast.AST) -> Dict:
+        n = {
             'compare_ops': [], 'bool_ops': [], 'functions': [], 'calls': [],
             'loops': [], 'returns': [], 'constants': [], 'names': [], 'imports': [],
             'attributes': [], 'assignments': [], 'if_nodes': [], 'try_nodes': [],
-            'breaks': 0, 'continues': 0, 'global_vars': [], 'nonlocal_vars': []
+            'breaks': 0, 'continues': 0, 'global_vars': [], 'nonlocal_vars': [],
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
-                for op in node.ops: nodes['compare_ops'].append(type(op).__name__)
+                for op in node.ops: n['compare_ops'].append(type(op).__name__)
             elif isinstance(node, ast.BoolOp):
-                nodes['bool_ops'].append(type(node.op).__name__)
+                n['bool_ops'].append(type(node.op).__name__)
             elif isinstance(node, ast.FunctionDef):
-                nodes['functions'].append({'name': node.name, 'args': [arg.arg for arg in node.args.args],
-                    'defaults': len(node.args.defaults), 'returns': ast.unparse(node.returns) if node.returns else None,
-                    'decorators': [ast.unparse(d) for d in node.decorator_list]})
+                n['functions'].append({
+                    'name': node.name,
+                    'args': [a.arg for a in node.args.args],
+                    'defaults': len(node.args.defaults),
+                    'returns': ast.unparse(node.returns) if node.returns else None,
+                })
             elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name): nodes['calls'].append(node.func.id)
-                elif isinstance(node.func, ast.Attribute): nodes['calls'].append(node.func.attr)
+                if isinstance(node.func, ast.Name): n['calls'].append(node.func.id)
+                elif isinstance(node.func, ast.Attribute): n['calls'].append(node.func.attr)
             elif isinstance(node, ast.For):
-                li = {'type': 'For'}
-                if hasattr(node, 'target'): li['target'] = ast.unparse(node.target)
-                if hasattr(node, 'iter'): li['iter'] = ast.unparse(node.iter)
-                nodes['loops'].append(li)
+                n['loops'].append({'type': 'For', 'iter': ast.unparse(node.iter) if hasattr(node, 'iter') else ''})
             elif isinstance(node, ast.While):
-                li = {'type': 'While'}
-                if hasattr(node, 'test'): li['test'] = ast.unparse(node.test)
-                nodes['loops'].append(li)
+                n['loops'].append({'type': 'While', 'test': ast.unparse(node.test) if hasattr(node, 'test') else ''})
             elif isinstance(node, ast.Return):
-                nodes['returns'].append(ast.unparse(node.value) if node.value else "None")
+                n['returns'].append(ast.unparse(node.value) if node.value else "None")
             elif isinstance(node, ast.Constant):
-                nodes['constants'].append({'type': type(node.value).__name__, 'value': str(node.value)[:50]})
-            elif isinstance(node, ast.Name): nodes['names'].append(node.id)
+                n['constants'].append({'type': type(node.value).__name__, 'value': str(node.value)[:50]})
+            elif isinstance(node, ast.Name): n['names'].append(node.id)
             elif isinstance(node, ast.Import):
-                for alias in node.names: nodes['imports'].append(alias.name)
+                for a in node.names: n['imports'].append(a.name)
             elif isinstance(node, ast.ImportFrom):
-                nodes['imports'].append(node.module if node.module else 'relative_import')
-            elif isinstance(node, ast.Attribute): nodes['attributes'].append(node.attr)
+                n['imports'].append(node.module or 'relative_import')
             elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name): nodes['assignments'].append(target.id)
+                for t in node.targets:
+                    if isinstance(t, ast.Name): n['assignments'].append(t.id)
             elif isinstance(node, ast.If):
-                if hasattr(node, 'test'): nodes['if_nodes'].append(ast.unparse(node.test))
-            elif isinstance(node, ast.Try): nodes['try_nodes'].append('try_except')
-            elif isinstance(node, ast.Break): nodes['breaks'] += 1
-            elif isinstance(node, ast.Continue): nodes['continues'] += 1
-            elif isinstance(node, ast.Global): nodes['global_vars'].extend(node.names)
-            elif isinstance(node, ast.Nonlocal): nodes['nonlocal_vars'].extend(node.names)
-        return nodes
+                n['if_nodes'].append(ast.unparse(node.test))
+            elif isinstance(node, ast.Try): n['try_nodes'].append('try')
+            elif isinstance(node, ast.Break): n['breaks'] += 1
+            elif isinstance(node, ast.Continue): n['continues'] += 1
+            elif isinstance(node, ast.Global): n['global_vars'].extend(node.names)
+            elif isinstance(node, ast.Nonlocal): n['nonlocal_vars'].extend(node.names)
+        return n
 
-    def _analyze_operators(self, old_code, new_code, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_compare = old_nodes['compare_ops']; new_compare = new_nodes['compare_ops']
-        old_bool = old_nodes['bool_ops']; new_bool = new_nodes['bool_ops']
-        boundary_changes = []
+    def _returns(self, tree):
+        r = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Return):
+                try: r.append(ast.unparse(n.value) if n.value else "None")
+                except: pass
+        return r
 
-        if ('Gt' in old_compare and 'GtE' in new_compare) or ('GtE' in old_compare and 'Gt' in new_compare):
-            boundary_changes.append('> ↔ >='); risk = max(risk, 40)
-        if ('Lt' in old_compare and 'LtE' in new_compare) or ('LtE' in old_compare and 'Lt' in new_compare):
-            boundary_changes.append('< ↔ <='); risk = max(risk, 40)
+    def _conds(self, tree):
+        c = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.If):
+                try: c.append(ast.unparse(n.test))
+                except: pass
+        return c
 
-        try:
-            old_t = safe_ast(old_code)
-            new_t = safe_ast(new_code)
-            old_has_unary_cmp = any(
-                isinstance(c, ast.UnaryOp)
-                for node in ast.walk(old_t) if isinstance(node, ast.Compare)
-                for c in node.comparators
-            )
-            new_has_unary_cmp = any(
-                isinstance(c, ast.UnaryOp)
-                for node in ast.walk(new_t) if isinstance(node, ast.Compare)
-                for c in node.comparators
-            )
-            if new_has_unary_cmp and not old_has_unary_cmp:
-                boundary_changes.append('UnaryOp-obfuscated boundary (e.g. >+/>-)'); risk = max(risk, 40)
-            elif old_has_unary_cmp and not new_has_unary_cmp:
-                boundary_changes.append('UnaryOp comparator removed'); risk = max(risk, 40)
-        except (ValueError, Exception):
-            pass
+    def _sigs(self, tree):
+        s = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef):
+                try: s[n.name] = str([a.arg for a in n.args.args])
+                except: pass
+        return s
 
-        if boundary_changes:
-            findings.append(AnalyzerResult(
-                name="ConditionShift",
-                findings=[f"Boundary operator adjustment: {', '.join(boundary_changes)}"],
-                risk=40,
-                details={'change_type': 'boundary_adjustment', 'changes': boundary_changes}
-            ))
-            details['boundary_changes'] = boundary_changes
-        equality_changes = []
-        if 'Eq' in old_compare and 'NotEq' in new_compare: equality_changes.append('== → !='); risk = max(risk, 80)
-        if 'NotEq' in old_compare and 'Eq' in new_compare: equality_changes.append('!= → =='); risk = max(risk, 80)
-        if equality_changes:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Equality operator inversion: {', '.join(equality_changes)}"], risk=80, details={'change_type': 'equality_inversion', 'changes': equality_changes}))
-            details['equality_changes'] = equality_changes
-        logical_changes = []
-        if 'And' in old_bool and 'Or' in new_bool: logical_changes.append('AND → OR'); risk = max(risk, 95)
-        if 'Or' in old_bool and 'And' in new_bool: logical_changes.append('OR → AND'); risk = max(risk, 95)
-        if logical_changes:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Critical logical operator change: {', '.join(logical_changes)}"], risk=95, details={'change_type': 'logical_inversion', 'changes': logical_changes}))
-            details['logical_changes'] = logical_changes
-        if set(old_compare) != set(new_compare) and not boundary_changes and not equality_changes:
-            old_set = set(old_compare); new_set = set(new_compare)
-            removed = old_set - new_set; added = new_set - old_set
-            if removed or added:
-                risk = max(risk, 45)
-                findings.append(AnalyzerResult(name="ConditionShift", findings=["Comparison operator modified"], risk=45, details={'removed': list(removed), 'added': list(added)}))
-                details['operator_changes'] = {'removed': list(removed), 'added': list(added)}
-        return risk, findings, details
+    # ── Analyzer sub-routines ────────────────────────────────────────────────
+    def _ops(self, old_code, new_code, on, nn):
+        f = []; r = 0; d = {}
+        oc = on['compare_ops']; nc = nn['compare_ops']
+        ob = on['bool_ops'];    nb = nn['bool_ops']
+        bc = []
+        if ('Gt' in oc and 'GtE' in nc) or ('GtE' in oc and 'Gt' in nc): bc.append('> ↔ >=')
+        if ('Lt' in oc and 'LtE' in nc) or ('LtE' in oc and 'Lt' in nc): bc.append('< ↔ <=')
+        if bc:
+            f.append(AnalyzerResult(name="ConditionShift", findings=[f"Boundary: {', '.join(bc)}"], risk=40))
+            d['boundary_changes'] = bc
+            r = max(r, 40)
+        if 'Eq' in oc and 'NotEq' in nc: f.append(AnalyzerResult(name="ConditionShift", findings=["== → !="], risk=80)); r = max(r, 80)
+        if 'NotEq' in oc and 'Eq' in nc: f.append(AnalyzerResult(name="ConditionShift", findings=["!= → =="], risk=80)); r = max(r, 80)
+        if 'And' in ob and 'Or' in nb:   f.append(AnalyzerResult(name="ConditionShift", findings=["AND → OR"], risk=95)); r = max(r, 95)
+        if 'Or' in ob and 'And' in nb:   f.append(AnalyzerResult(name="ConditionShift", findings=["OR → AND"], risk=95)); r = max(r, 95)
+        return r, f, d
 
-    def _analyze_functions(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_funcs = {f['name']: f for f in old_nodes['functions']}
-        new_funcs = {f['name']: f for f in new_nodes['functions']}
-        old_calls = set(old_nodes['calls']); new_calls = set(new_nodes['calls'])
+    def _funcs(self, on, nn):
+        f = []; r = 0; d = {}
+        old_funcs = {x['name']: x for x in on['functions']}
+        new_funcs = {x['name']: x for x in nn['functions']}
+        old_calls = set(on['calls']); new_calls = set(nn['calls'])
         old_names = set(old_funcs.keys()); new_names = set(new_funcs.keys())
+
+        # FIX 1: function_rename — single func, name changed
         if len(old_funcs) == len(new_funcs) == 1 and old_names != new_names:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Function renamed: {list(old_names)[0]} → {list(new_names)[0]}"], risk=35, details={'change_type': 'function_rename'}))
-            details['function_rename'] = True; risk = max(risk, 35)
+            f.append(AnalyzerResult(name="ConditionShift",
+                findings=[f"Function renamed: {list(old_names)[0]} → {list(new_names)[0]}"],
+                risk=35, details={'change_type': 'function_rename'}))
+            d['function_rename'] = True; r = max(r, 35)
         else:
-            added_funcs = new_names - old_names; removed_funcs = old_names - new_names
-            if added_funcs and len(added_funcs) == len(removed_funcs) and len(added_funcs) <= 2:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=["Functions renamed or swapped — review call sites"], risk=35, details={'change_type': 'function_swap'}))
-                details['function_swap'] = True; risk = max(risk, 35)
-            elif added_funcs:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"New functions added: {', '.join(list(added_funcs)[:3])}"], risk=30, details={'change_type': 'functions_added'}))
-                risk = max(risk, 30)
-            if removed_funcs and not details.get('function_swap'):
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Functions removed: {', '.join(list(removed_funcs)[:3])}"], risk=70, details={'change_type': 'functions_removed'}))
-                risk = max(risk, 70)
-        for func_name in old_names.intersection(new_names):
-            old_func = old_funcs[func_name]; new_func = new_funcs[func_name]
-            if old_func['args'] != new_func['args'] or old_func['defaults'] != new_func['defaults']:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Function '{func_name}' signature changed"], risk=65, details={'change_type': 'function_signature_change'}))
-                risk = max(risk, 65)
-            if old_func['returns'] != new_func['returns']:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Function '{func_name}' return type changed"], risk=60, details={'change_type': 'return_type_change'}))
-                risk = max(risk, 60)
+            added = new_names - old_names; removed = old_names - new_names
+            # FIX 2: function_swap — equal count added/removed
+            if added and len(added) == len(removed) and len(added) <= 2:
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=["Functions renamed or swapped — review call sites"],
+                    risk=35, details={'change_type': 'function_swap'}))
+                d['function_swap'] = True; r = max(r, 35)
+            elif added:
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=[f"New functions added: {', '.join(list(added)[:3])}"],
+                    risk=30, details={'change_type': 'functions_added'}))
+                r = max(r, 30)
+            if removed and not d.get('function_swap'):
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=[f"Functions removed: {', '.join(list(removed)[:3])}"],
+                    risk=70, details={'change_type': 'functions_removed'}))
+                r = max(r, 70)
+
+        for fn in old_names & new_names:
+            of = old_funcs[fn]; nf = new_funcs[fn]
+            if of['args'] != nf['args'] or of.get('defaults',0) != nf.get('defaults',0):
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=[f"Function '{fn}' signature changed"],
+                    risk=65, details={'change_type': 'function_signature_change'}))
+                r = max(r, 65)
+            # FIX 3: return_type_change
+            if of.get('returns') != nf.get('returns'):
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=[f"Function '{fn}' return type changed: {of.get('returns')} → {nf.get('returns')}"],
+                    risk=60, details={'change_type': 'return_type_change'}))
+                r = max(r, 60)
+
         if old_calls != new_calls:
-            added = new_calls - old_calls; removed = old_calls - new_calls
-            if added or removed:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Function call patterns changed (removed: {list(removed)[:3]}, added: {list(added)[:3]})"], risk=60, details={'change_type': 'call_pattern_change', 'added_calls': list(added)[:5], 'removed_calls': list(removed)[:5]}))
-                details['call_changes'] = {'added': list(added), 'removed': list(removed)}
-                risk = max(risk, 60)
-        return risk, findings, details
+            added_c = new_calls - old_calls; removed_c = old_calls - new_calls
+            if added_c or removed_c:
+                f.append(AnalyzerResult(name="ConditionShift",
+                    findings=[f"Call patterns changed (removed: {list(removed_c)[:3]}, added: {list(added_c)[:3]})"],
+                    risk=60, details={'change_type': 'call_pattern_change',
+                                      'added_calls': list(added_c)[:5], 'removed_calls': list(removed_c)[:5]}))
+                d['call_changes'] = {'added': list(added_c), 'removed': list(removed_c)}
+                r = max(r, 60)
+        return r, f, d
+    def _loops(self, on, nn):
+        f = []; r = 0; d = {}
+        old_loops = on['loops']; new_loops = nn['loops']
+        old_types = [l['type'] for l in old_loops]
+        new_types = [l['type'] for l in new_loops]
+        # FIX 6: break/continue count
+        old_breaks = on.get('breaks', 0); new_breaks = nn.get('breaks', 0)
+        old_conts  = on.get('continues', 0); new_conts = nn.get('continues', 0)
 
-    def _analyze_loops(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_loops = old_nodes['loops']; new_loops = new_nodes['loops']
-        old_types = [l['type'] for l in old_loops]; new_types = [l['type'] for l in new_loops]
-        old_breaks = old_nodes.get('breaks', 0); new_breaks = new_nodes.get('breaks', 0)
-        old_continues = old_nodes.get('continues', 0); new_continues = new_nodes.get('continues', 0)
         if len(old_loops) != len(new_loops):
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Loop count changed: {len(old_loops)} → {len(new_loops)}"], risk=40, details={'change_type': 'loop_count_change'}))
-            details['loop_count_change'] = True; risk = max(risk, 40)
+            f.append(AnalyzerResult(name="ConditionShift",
+                findings=[f"Loop count changed: {len(old_loops)} → {len(new_loops)}"],
+                risk=40, details={'change_type': 'loop_count_change'}))
+            d['loop_count_change'] = True; r = max(r, 40)
+
         if 'For' in old_types and 'While' in new_types and 'For' not in new_types:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Loop type changed: FOR → WHILE"], risk=70, details={'change_type': 'loop_type_for_to_while'}))
-            risk = max(risk, 70)
+            f.append(AnalyzerResult(name="ConditionShift",
+                findings=["Loop type changed: FOR → WHILE"], risk=70,
+                details={'change_type': 'loop_type_for_to_while'}))
+            r = max(r, 70)
         if 'While' in old_types and 'For' in new_types and 'While' not in new_types:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Loop type changed: WHILE → FOR"], risk=70, details={'change_type': 'loop_type_while_to_for'}))
-            risk = max(risk, 70)
-        for i, (old_loop, new_loop) in enumerate(zip(old_loops, new_loops)):
-            if old_loop['type'] == new_loop['type']:
-                if old_loop['type'] == 'For' and old_loop.get('iter') != new_loop.get('iter'):
-                    findings.append(AnalyzerResult(name="ConditionShift", findings=["FOR loop range modified"], risk=45, details={}))
-                    risk = max(risk, 45)
-                if old_loop['type'] == 'While' and old_loop.get('test') != new_loop.get('test'):
-                    findings.append(AnalyzerResult(name="ConditionShift", findings=["WHILE loop condition modified"], risk=50, details={}))
-                    risk = max(risk, 50)
-        if old_breaks != new_breaks or old_continues != new_continues:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Loop control statements changed: break({old_breaks}→{new_breaks}), continue({old_continues}→{new_continues})"], risk=40, details={}))
-            risk = max(risk, 40)
-        return risk, findings, details
+            f.append(AnalyzerResult(name="ConditionShift",
+                findings=["Loop type changed: WHILE → FOR"], risk=70,
+                details={'change_type': 'loop_type_while_to_for'}))
+            r = max(r, 70)
 
-    def _analyze_imports(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_imports = set(old_nodes['imports']); new_imports = set(new_nodes['imports'])
-        added = new_imports - old_imports; removed = old_imports - new_imports
+        # FIX 4: FOR iter change, FIX 5: WHILE condition change
+        for ol, nl in zip(old_loops, new_loops):
+            if ol['type'] == nl['type']:
+                if ol['type'] == 'For' and ol.get('iter') != nl.get('iter'):
+                    f.append(AnalyzerResult(name="ConditionShift",
+                        findings=["FOR loop range/iterator modified"], risk=45, details={}))
+                    r = max(r, 45)
+                if ol['type'] == 'While' and ol.get('test') != nl.get('test'):
+                    f.append(AnalyzerResult(name="ConditionShift",
+                        findings=["WHILE loop condition modified"], risk=50, details={}))
+                    r = max(r, 50)
+
+        if old_breaks != new_breaks or old_conts != new_conts:
+            f.append(AnalyzerResult(name="ConditionShift",
+                findings=[f"Loop control changed: break({old_breaks}→{new_breaks}), continue({old_conts}→{new_conts})"],
+                risk=40, details={}))
+            r = max(r, 40)
+        return r, f, d
+    def _imports(self, on, nn):
+        f = []; r = 0; d = {}
+        oi = set(on['imports']); ni = set(nn['imports'])
+        added = ni - oi; removed = oi - ni
         if added:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"New dependencies added: {', '.join(list(added)[:3])}"], risk=25, details={'imports_added': list(added)}))
-            details['imports_added'] = list(added); risk = max(risk, 25)
+            f.append(AnalyzerResult(name="ConditionShift", findings=[f"Imports added: {list(added)[:3]}"], risk=25))
+            d['imports_added'] = list(added); r = max(r, 25)
         if removed:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Dependencies removed: {', '.join(list(removed)[:3])}"], risk=55, details={'imports_removed': list(removed)}))
-            details['imports_removed'] = list(removed); risk = max(risk, 55)
-        return risk, findings, details
+            f.append(AnalyzerResult(name="ConditionShift", findings=[f"Imports removed: {list(removed)[:3]}"], risk=55))
+            d['imports_removed'] = list(removed); r = max(r, 55)
+        return r, f, d
 
-    def _analyze_datatypes(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_type_set = {c['type'] for c in old_nodes['constants']}
-        new_type_set = {c['type'] for c in new_nodes['constants']}
-        type_changes = []
-        if 'int' in old_type_set and 'float' in new_type_set: type_changes.append('int → float')
-        if 'float' in old_type_set and 'int' in new_type_set: type_changes.append('float → int (precision loss)')
-        if type_changes:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Data type changes: {', '.join(type_changes)}"], risk=50, details={'datatype_changes': type_changes}))
-            details['datatype_changes'] = type_changes; risk = max(risk, 50)
-        old_returns = [r for r in old_nodes['returns'] if r and r != "None"]
-        new_returns = [r for r in new_nodes['returns'] if r and r != "None"]
-        if set(old_returns) != set(new_returns):
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Return values changed"], risk=55, details={}))
-            details['return_changes'] = True; risk = max(risk, 55)
-        return risk, findings, details
+    def _types(self, on, nn):
+        f = []; r = 0; d = {}
+        ot = {c['type'] for c in on['constants']}; nt = {c['type'] for c in nn['constants']}
+        if 'int' in ot and 'float' in nt:
+            f.append(AnalyzerResult(name="ConditionShift", findings=["int→float"], risk=50)); r = 50
+        if 'float' in ot and 'int' in nt:
+            f.append(AnalyzerResult(name="ConditionShift", findings=["float→int (precision loss)"], risk=50)); r = 50
+        return r, f, d
 
-    def _analyze_control_flow(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_ifs = len(old_nodes['if_nodes']); new_ifs = len(new_nodes['if_nodes'])
-        old_trys = len(old_nodes['try_nodes']); new_trys = len(new_nodes['try_nodes'])
-        if old_ifs != new_ifs:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Conditional branches changed: {old_ifs} → {new_ifs} if statements"], risk=40, details={}))
-            details['if_change'] = True; risk = max(risk, 40)
-        if old_trys != new_trys:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Exception handling changed: {old_trys} → {new_trys} try blocks"], risk=35, details={}))
-            details['try_change'] = True; risk = max(risk, 35)
-        return risk, findings, details
+    def _cf(self, on, nn):
+        f = []; r = 0; d = {}
+        if len(on['if_nodes']) != len(nn['if_nodes']):
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Branch count changed"], risk=40)); r = 40
+        if len(on['try_nodes']) != len(nn['try_nodes']):
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Try-block count changed"], risk=35)); r = max(r, 35)
+        return r, f, d
 
-    def _analyze_variable_scope(self, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_globals = set(old_nodes.get('global_vars', [])); new_globals = set(new_nodes.get('global_vars', []))
-        if old_globals != new_globals:
-            added_globals = new_globals - old_globals; removed_globals = old_globals - new_globals
-            if added_globals or removed_globals:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=[f"Global variable scope changed — added: {list(added_globals) or 'none'}, removed: {list(removed_globals) or 'none'}"], risk=50, details={}))
-                details['global_scope_change'] = True; risk = max(risk, 50)
-        old_nonlocals = set(old_nodes.get('nonlocal_vars', [])); new_nonlocals = set(new_nodes.get('nonlocal_vars', []))
-        if old_nonlocals != new_nonlocals:
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Nonlocal variable scope changed"], risk=45, details={}))
-            details['nonlocal_scope_change'] = True; risk = max(risk, 45)
-        return risk, findings, details
+    def _scope(self, on, nn):
+        f = []; r = 0; d = {}
+        if set(on.get('global_vars', [])) != set(nn.get('global_vars', [])):
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Global scope changed"], risk=50)); r = 50
+        return r, f, d
 
-    def _analyze_structural(self, old_ast, new_ast, old_nodes, new_nodes):
-        findings = []; risk = 0; details = {}
-        old_names = set(old_nodes['names']); new_names = set(new_nodes['names'])
-        if old_names != new_names:
-            if abs(len(old_names) - len(new_names)) <= 2:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=["Variable names changed — likely cosmetic refactoring"], risk=5, details={'change_type': 'variable_rename'}))
-                details['variable_rename'] = True; risk = max(risk, 5)
-            else:
-                findings.append(AnalyzerResult(name="ConditionShift", findings=["Significant variable structure changes"], risk=40, details={'change_type': 'variable_structure_change'}))
-                details['variable_structure_change'] = True; risk = max(risk, 40)
-        old_assigns = set(old_nodes['assignments']); new_assigns = set(new_nodes['assignments'])
-        if old_assigns != new_assigns and not details.get('variable_rename'):
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Assignment patterns changed"], risk=30, details={}))
-            details['assignment_change'] = True; risk = max(risk, 30)
-        if risk == 0 and ast.dump(old_ast) != ast.dump(new_ast):
-            findings.append(AnalyzerResult(name="ConditionShift", findings=["Minor structural changes — likely cosmetic"], risk=5, details={'change_type': 'cosmetic_change'}))
-            details['cosmetic_change'] = True; risk = 5
-        return risk, findings, details
+    def _structural(self, oa, na, on, nn):
+        f = []; r = 0; d = {}
+        if set(on['names']) != set(nn['names']):
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Variable names changed"], risk=5)); r = 5
+        elif ast.dump(oa) != ast.dump(na):
+            f.append(AnalyzerResult(name="ConditionShift", findings=["Cosmetic changes"], risk=5)); r = 5
+        return r, f, d
 
 
 # ============================================================================
-# COMPLIANCE ANALYZER
+# CODE QUALITY ANALYZER
 # ============================================================================
 
-class ComplianceAnalyzer:
-    def analyze(self, code: str, expected: str) -> Tuple[List[AnalyzerResult], int, Dict[str, Any]]:
+class CodeQualityAnalyzer:
+    def analyze(self, code: str) -> Tuple[int, List[Dict]]:
+        issues = []
         try:
-            tree = safe_ast(code)
+            tree = _safe_ast(code)
         except ValueError as e:
-            return [AnalyzerResult(
-                name="SyntaxError",
-                findings=[f"Code contains a syntax error and cannot be analysed: {str(e)}"],
-                risk=100,
-                details={"error": str(e), "parse_error": True, "syntax_error": True}
-            )], 100, {"parse_error": True, "syntax_error": True}
+            return 0, [{"type": "ParseError", "message": str(e), "severity": "high"}]
+        issues.extend(self._unused(tree))
+        issues.extend(self._nesting(tree))
+        issues.extend(self._complexity(tree))
+        issues.extend(self._unreachable(tree))
+        issues.extend(self._dupes(tree))
+        deduct = {"critical": 15, "high": 10, "medium": 5, "low": 2}
+        return max(0, 100 - sum(deduct.get(i.get("severity", "low"), 2) for i in issues)), issues
 
-        src_hash = hash_source(code)
-        if not expected.strip():
-            return [], 0, {"semantic_similarity": 1.0, "invariant_broken": False, "source_hash": src_hash, "comparison_method": "no_contract_specified"}
-
-        identifiers = extract_identifiers(tree)
-        function_names = extract_function_names(tree)
-        call_graph = extract_call_graph(tree)
-        control_flow_sig = compute_control_flow_signature(tree)
-        constants = set()
+    def _unused(self, tree):
+        issues = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.Constant):
-                constants.add(str(node.value).lower())
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assigned = set(); used = set()
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Assign):
+                        for t in child.targets:
+                            if isinstance(t, ast.Name): assigned.add(t.id)
+                    elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                        used.add(child.id)
+                for v in list(assigned - used - {'_'})[:3]:
+                    issues.append({"type": "UnusedVariable", "message": f"'{v}' unused in '{node.name}'", "severity": "low"})
+        return issues
 
-        expected_lower = expected.lower()
-        expected_words = set(expected_lower.split())
-        identifier_match = identifiers.intersection(expected_words)
-        function_match = function_names.intersection(expected_words)
-        constant_match = constants.intersection(expected_words)
-        MIN_SIMILARITY_FLOOR = 0.2
-        all_matches = identifier_match.union(function_match).union(constant_match)
-        weighted_score = len(function_match) * 3.0 + len(identifier_match) * 1.0 + len(constant_match) * 0.5
-        max_possible_score = len(expected_words) * 3.0
-        similarity = min(weighted_score / max_possible_score, 1.0) if max_possible_score > 0 else 0.0
-        if len(expected_words) <= 3 and len(all_matches) == 0:
-            similarity = max(similarity, MIN_SIMILARITY_FLOOR)
+    def _nesting(self, tree):
+        issues = []
+        def depth(node, cur=0):
+            d = cur
+            for ch in ast.iter_child_nodes(node):
+                if isinstance(ch, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+                    d = max(d, depth(ch, cur + 1))
+                else:
+                    d = max(d, depth(ch, cur))
+            return d
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                d = depth(node)
+                if d > 4:
+                    issues.append({"type": "ExcessiveNesting", "message": f"'{node.name}' depth={d}", "severity": "medium"})
+        return issues
 
-        if similarity >= 0.7: risk = 0
-        elif similarity >= 0.5: risk = 20
-        elif similarity >= 0.3: risk = 40
-        elif similarity >= 0.1: risk = 60
-        else: risk = 80
+    def _complexity(self, tree):
+        issues = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                cc = 1
+                for ch in ast.walk(node):
+                    if isinstance(ch, (ast.If, ast.For, ast.While, ast.ExceptHandler, ast.With, ast.Assert)):
+                        cc += 1
+                    elif isinstance(ch, ast.BoolOp):
+                        cc += len(ch.values) - 1
+                if cc > 10:
+                    issues.append({"type": "HighComplexity", "message": f"'{node.name}' CC={cc}", "severity": "high"})
+                length = (getattr(node, 'end_lineno', node.lineno) - node.lineno + 1)
+                if length > 50:
+                    issues.append({"type": "LongFunction", "message": f"'{node.name}' {length} lines", "severity": "medium"})
+        return issues
 
+    def _unreachable(self, tree):
+        issues = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for i, stmt in enumerate(node.body[:-1]):
+                    if isinstance(stmt, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+                        issues.append({"type": "UnreachableCode", "message": f"Unreachable after {type(stmt).__name__} in '{node.name}'", "severity": "medium"})
+                        break
+        return issues
+
+    def _dupes(self, tree):
+        issues = []; cm = defaultdict(list)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                try:
+                    cond = ast.unparse(node.test)
+                    cm[cond].append(getattr(node, 'lineno', 0))
+                except: pass
+        for cond, lines in cm.items():
+            if len(lines) > 1:
+                issues.append({"type": "DuplicateLogic", "message": f"'{cond[:60]}' appears {len(lines)}x", "severity": "low"})
+        return issues
+
+
+# ============================================================================
+# SECURITY ANALYZER
+# ============================================================================
+
+class SecurityAnalyzer:
+    DANGEROUS_CALLS = {
+        'eval':     ('critical', 'eval() — RCE risk', 'CWE-78'),
+        'exec':     ('critical', 'exec() — RCE risk', 'CWE-78'),
+        'compile':  ('high',     'compile() — arbitrary code', 'CWE-94'),
+        '__import__': ('high',   'Dynamic import', 'CWE-94'),
+    }
+    DANGEROUS_ATTRS = {
+        'loads': ('critical', 'pickle.loads() — deserialization RCE', 'CWE-502'),
+        'load':  ('high',     'pickle.load() — untrusted data', 'CWE-502'),
+        'system': ('high',    'os.system() — shell injection', 'CWE-78'),
+        'Popen':  ('high',    'subprocess.Popen() — injection risk', 'CWE-78'),
+    }
+    WEAK_HASH    = {'md5', 'sha1'}
+    INSECURE_RNG = {'random', 'randint', 'choice', 'shuffle', 'seed'}
+    SECRET_PAT   = [
+        re.compile(r'(?:password|passwd|pwd|secret|api_key|apikey|token)\s*=\s*["\'][^"\']{4,}["\']', re.I),
+    ]
+
+    def analyze(self, code: str) -> Tuple[int, List[Dict]]:
         findings = []
-        if risk > 0:
-            findings.append(AnalyzerResult(name="ContractViolation", findings=[f"Expected behavior alignment: {similarity*100:.1f}% — code may not fully implement specification"], risk=risk, details={"similarity_score": round(similarity, 3)}))
+        try:
+            tree = _safe_ast(code)
+        except ValueError as e:
+            return 100, [{"type": "ParseError", "message": str(e), "severity": "critical"}]
+        findings.extend(self._dangerous_calls(tree))
+        findings.extend(self._dangerous_attrs(tree))
+        findings.extend(self._weak_hash(tree))
+        findings.extend(self._insecure_rng(tree))
+        findings.extend(self._subprocess(tree))
+        findings.extend(self._secrets(code))
+        weights = {'critical': 30, 'high': 15, 'medium': 8, 'low': 3}
+        return max(0, 100 - sum(weights.get(f.get('severity', 'low'), 3) for f in findings)), findings
 
-        return findings, risk, {
-            "semantic_similarity": similarity, "invariant_broken": risk > 50, "source_hash": src_hash,
-            "comparison_method": "ast_structural_weighted_match",
-            "identifiers_in_code": sorted(list(identifiers))[:15],
-            "functions_in_code": sorted(list(function_names)),
-            "control_flow_signature": control_flow_sig,
-            "similarity_percentage": round(similarity * 100, 2)
+    def _dangerous_calls(self, tree):
+        f = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                nm = n.func.id
+                if nm in self.DANGEROUS_CALLS:
+                    sev, msg, cwe = self.DANGEROUS_CALLS[nm]
+                    f.append({"type": "DangerousFunction", "message": msg, "function": nm, "severity": sev, "cwe": cwe})
+        return f
+
+    def _dangerous_attrs(self, tree):
+        f = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                attr = n.func.attr
+                if attr in self.DANGEROUS_ATTRS:
+                    sev, msg, cwe = self.DANGEROUS_ATTRS[attr]
+                    f.append({"type": "DangerousMethod", "message": msg, "method": attr, "severity": sev, "cwe": cwe})
+        return f
+
+    def _weak_hash(self, tree):
+        f = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                nm = ""
+                if isinstance(n.func, ast.Attribute): nm = n.func.attr.lower()
+                elif isinstance(n.func, ast.Name): nm = n.func.id.lower()
+                if nm in self.WEAK_HASH:
+                    f.append({"type": "WeakHashing", "message": f"{nm.upper()} — use SHA-256/bcrypt", "severity": "high", "cwe": "CWE-327"})
+        return f
+
+    def _insecure_rng(self, tree):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                nm = ""
+                if isinstance(n.func, ast.Attribute): nm = n.func.attr
+                elif isinstance(n.func, ast.Name): nm = n.func.id
+                if nm in self.INSECURE_RNG:
+                    if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == 'secrets':
+                        continue
+                    return [{"type": "InsecureRandom", "message": f"random.{nm}() — use secrets module", "severity": "medium", "cwe": "CWE-338"}]
+        return []
+
+    def _subprocess(self, tree):
+        f = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call):
+                is_sp = False
+                if isinstance(n.func, ast.Attribute):
+                    if (isinstance(n.func.value, ast.Name) and n.func.value.id == 'subprocess') or n.func.attr in ('call', 'run', 'Popen', 'check_output'):
+                        is_sp = True
+                if is_sp:
+                    for kw in n.keywords:
+                        if kw.arg == 'shell' and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                            f.append({"type": "SubprocessShellTrue", "message": "shell=True — command injection risk", "severity": "critical", "cwe": "CWE-78"})
+        return f
+
+    def _secrets(self, code):
+        f = []
+        for pat in self.SECRET_PAT:
+            for m in pat.findall(code)[:2]:
+                f.append({"type": "HardcodedSecret", "message": f"Credential: '{m[:50]}...' — use env vars", "severity": "critical", "cwe": "CWE-798"})
+        return f
+
+
+# ============================================================================
+# EXECUTION PREDICTOR
+# ============================================================================
+
+class ExecutionPredictor:
+    def predict(self, code: str) -> Dict[str, Any]:
+        try:
+            tree = _safe_ast(code)
+        except ValueError as e:
+            return {"possible_outputs": ["Parse error"], "return_values": [], "print_outputs": [],
+                    "branches": [], "state_changes": [], "exceptions": [], "auth_outcomes": [],
+                    "confidence": 0.0, "execution_paths": 1}
+        rets = []; prints = []; branches = []; auth = []; states = []; excs = []
+        self._rets(tree, rets); self._prints(tree, prints); self._branches(tree, branches)
+        self._auth(tree, auth); self._states(tree, states); self._excs(tree, excs)
+        outputs = list(dict.fromkeys(rets[:5] + prints[:3] + auth[:3])) or ["No explicit outputs"]
+        total = sum(1 for _ in ast.walk(tree))
+        conf  = round(min(0.95, 0.5 + (len(rets) + len(prints) + len(branches)) / max(total, 1) * 0.5), 2)
+        return {
+            "possible_outputs": outputs,
+            "return_values": rets[:8],
+            "print_outputs": prints[:5],
+            "branches": branches[:8],
+            "state_changes": states[:6],
+            "exceptions": excs[:5],
+            "auth_outcomes": auth,
+            "confidence": conf,
+            "execution_paths": len(branches) + 1,
         }
 
+    def _rets(self, tree, r):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Return) and n.value:
+                try:
+                    if isinstance(n.value, ast.Constant): r.append(f'→ returns: {repr(n.value.value)}')
+                    elif isinstance(n.value, ast.Name):   r.append(f'→ returns var: {n.value.id}')
+                    elif isinstance(n.value, ast.Dict):   r.append('→ returns: dict')
+                    elif isinstance(n.value, ast.List):   r.append('→ returns: list')
+                    else: r.append(f'→ returns: {ast.unparse(n.value)[:60]}')
+                except: pass
+
+    def _prints(self, tree, r):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'print' and n.args:
+                try:
+                    a = n.args[0]
+                    if isinstance(a, ast.Constant): r.append(f'prints: {repr(a.value)[:60]}')
+                    elif isinstance(a, ast.JoinedStr): r.append('prints: f-string')
+                    else: r.append(f'prints: {ast.unparse(a)[:60]}')
+                except: pass
+
+    def _branches(self, tree, r):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.If):
+                try:
+                    cond = ast.unparse(n.test)
+                    tr = [ast.unparse(x.value) if x.value else "None" for x in ast.walk(ast.Module(body=n.body, type_ignores=[])) if isinstance(x, ast.Return)]
+                    er = [ast.unparse(x.value) if x.value else "None" for x in ast.walk(ast.Module(body=n.orelse, type_ignores=[])) if isinstance(x, ast.Return)] if n.orelse else []
+                    r.append({"condition": cond[:80], "true_path": tr[:2] or ["continues"], "false_path": er[:2] or ["falls through"]})
+                except: pass
+
+    def _auth(self, tree, r):
+        kw = {'admin','role','permission','authenticated','authorized','login','logout','token','access','grant','deny'}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.If):
+                try:
+                    cond = ast.unparse(n.test).lower()
+                    if any(k in cond for k in kw):
+                        for ch in ast.walk(ast.Module(body=n.body, type_ignores=[])):
+                            if isinstance(ch, ast.Return) and isinstance(ch.value, ast.Constant):
+                                r.append(f'Auth: if {cond[:40]}: returns {repr(ch.value.value)}')
+                except: pass
+
+    def _states(self, tree, r):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.AugAssign):
+                try: r.append(f'State: {ast.unparse(n.target)} {type(n.op).__name__}= {ast.unparse(n.value)}')
+                except: pass
+            elif isinstance(n, ast.Assign):
+                try:
+                    for t in n.targets:
+                        if isinstance(t, ast.Name) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, (int, float, bool)):
+                            r.append(f'State: {t.id} = {n.value.value}')
+                except: pass
+
+    def _excs(self, tree, r):
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Raise):
+                try: r.append(f'Raises: {ast.unparse(n.exc)[:60]}' if n.exc else 'Re-raises')
+                except: pass
+            elif isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+                try:
+                    if isinstance(n.right, ast.Constant) and n.right.value == 0:
+                        r.append('Risk: division by zero')
+                    else:
+                        r.append(f'Potential ZeroDivisionError: {ast.unparse(n)[:50]}')
+                except: pass
+
 
 # ============================================================================
-# UNIFIED INTELLIGENCE SCORE
+# AI EXPLAINER
 # ============================================================================
 
-def compute_overall_score(risk_score: int, quality_score: int, security_score: int, behavior_score: int) -> int:
-    safety = max(0, 100 - risk_score)
-    overall = int(
-        safety * 0.30 +
-        quality_score * 0.25 +
-        security_score * 0.30 +
-        behavior_score * 0.15
+def _call_gemini(prompt: str) -> Tuple[str, str]:
+    """Call Gemini via pure REST — no SDK, no grpcio, no Rust required."""
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY not set")
+    resp = requests.post(
+        f"{_GEMINI_URL}?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json={"contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"maxOutputTokens": 700, "temperature": 0.2}},
+        timeout=30,
     )
-    return max(0, min(100, overall))
+    resp.raise_for_status()
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    return text.strip(), "Gemini"
 
+def _call_openrouter(prompt: str) -> Tuple[str, str]:
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+        json={"model": "mistralai/mistral-7b-instruct", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 700},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"], "OpenRouter"
 
-# ============================================================================
-# AI CALLS
-# ============================================================================
-
-def call_gemini(prompt: str) -> Tuple[str, str]:
-    if not gemini_model:
-        raise Exception("Gemini not configured")
-    try:
-        r = gemini_model.generate_content(prompt)
-        return r.text.strip(), "Gemini"
-    except Exception as e:
-        raise Exception(f"Gemini API Error: {str(e)}")
-
-def call_openrouter(prompt: str) -> Tuple[str, str]:
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "mistralai/mistral-7b-instruct", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 700},
-            timeout=30
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"], "OpenRouter"
-    except Exception as e:
-        raise Exception(f"OpenRouter API Error: {str(e)}")
-
-def ai(prompt: str) -> Tuple[str, str]:
-    if gemini_model:
-        try:
-            return call_gemini(prompt)
-        except Exception as e:
-            print(f"⚠️ Gemini failed: {e}")
+def _ai(prompt: str) -> Tuple[str, str]:
+    if GEMINI_API_KEY:
+        try: return _call_gemini(prompt)
+        except Exception as e: print(f"⚠️ Gemini: {e}")
     if OPENROUTER_ENABLED:
-        try:
-            return call_openrouter(prompt)
-        except Exception as e:
-            print(f"⚠️ OpenRouter failed: {e}")
-    return ("AI analysis unavailable. Please check API keys.", "None")
+        try: return _call_openrouter(prompt)
+        except Exception as e: print(f"⚠️ OpenRouter: {e}")
+    return "AI unavailable.", "None"
 
+class AIExplainer:
+    """Generates technical, human, and behavioral explanations."""
 
-# ============================================================================
-# AI PROMPTS
-# ============================================================================
-
-def technical_prompt(mode: str, signals: Dict, findings: List, risk: int, depth: str = "balanced") -> str:
-    if depth == "academic":
-        return f"""You are a senior static analysis engineer presenting to academic peers.
-Context: Mode={mode}, Risk={risk}
-Findings: {json.dumps([f.dict() if hasattr(f, 'dict') else f for f in findings], indent=2)}
-Explain using formal terminology: AST parsing, semantic analysis, CFG, DFA, invariants.
-Keep response under 150 words."""
-    elif depth == "simple":
-        return f"""You are a code reviewer explaining to a developer.
-Mode={mode}, Risk={risk}, Changes detected: {len(findings)}
-Explain what changed, what could go wrong, why it matters.
-Keep under 100 words. Be direct."""
-    else:
-        return f"""You are a senior static analysis engineer.
-Context: Mode={mode}, Risk={risk}
-Findings: {json.dumps([f.dict() if hasattr(f, 'dict') else f for f in findings], indent=2)}
-Explain what technically caused the issue, which assumption was violated, why risk score is justified.
-Keep under 120 words."""
-
-def human_prompt(findings: List, risk: int) -> str:
-    return f"""You are explaining to a non-technical stakeholder.
-Findings: {len(findings)} issues detected, Risk Score: {risk}/100
-Explain what can go wrong, why it matters, what level of attention is needed.
-Keep under 100 words."""
-
-def comprehensive_analysis_prompt(old_code: str, new_code: str) -> str:
-    return f"""You are an expert Python static analysis engine.
-OLD CODE:
-{old_code}
-NEW CODE:
-{new_code}
-Perform comprehensive comparison. Analyze: operators, control flow, functions, imports, data types, variables, AST structure.
-For each change: category, old vs new, risk (LOW/MEDIUM/HIGH), impact.
-Return overall risk score 0-100 with justification. Keep under 300 words."""
-
-def compliance_solution_prompt(hash_code: str, expected: str, risk: int) -> str:
-    return f"""You are a software architect. Code Hash: {hash_code}, Expected: {expected}, Risk: {risk}
-What should be verified, tested, and changed? Keep high-level and actionable. Under 120 words."""
-
-def semantic_explanation_prompt(old_code: str, new_code: str, findings: List, risk: int,
-                                quality_score: int, security_score: int,
-                                hashes: Optional[Dict] = None,
-                                execution_prediction: Optional[Dict] = None) -> str:
-    hash_block = ""
-    if hashes:
-        hash_block = f"""
-Code Integrity Hashes:
-  old_hash      : {hashes.get('old_hash', 'N/A')[:24]}...
-  new_hash      : {hashes.get('new_hash', 'N/A')[:24]}...
-  semantic_hash : {hashes.get('semantic_hash', 'N/A')[:24]}...
+    def explain(
+        self,
+        old_code: str, new_code: str,
+        findings: List, risk: int,
+        quality: int, security: int,
+        hashes: Dict, exec_pred: Dict,
+    ) -> Dict[str, str]:
+        pred_block = ""
+        if exec_pred.get("possible_outputs"):
+            pred_block = f"""
+Execution Prediction (confidence {exec_pred.get('confidence', 0)}):
+  Outputs   : {exec_pred.get('possible_outputs', [])[:5]}
+  Exceptions: {exec_pred.get('exceptions', [])[:3]}
 """
+        prompt = f"""You are CRONOS v8 — enterprise static analysis engine. EXPLANATION ONLY.
 
-    pred_block = ""
-    if execution_prediction and execution_prediction.get("possible_outputs"):
-        outs = execution_prediction.get("possible_outputs", [])[:5]
-        exc  = execution_prediction.get("exceptions", [])[:3]
-        conf = execution_prediction.get("confidence", 0)
-        pred_block = f"""
-Execution Prediction (AST-simulated, confidence {conf}):
-  Possible outputs : {outs}
-  Exception risks  : {exc}
-"""
-
-    return f"""You are CRONOS v8 — an enterprise static analysis intelligence engine.
-Your role is EXPLANATION ONLY. You must NOT change or influence any numeric score.
-
-STRUCTURED CONTEXT:
-══════════════════════════════════════════════
-Risk Score    : {risk}/100
-Quality Score : {quality_score}/100
-Security Score: {security_score}/100
-Findings Count: {len(findings)}
-{hash_block}{pred_block}
+Context:
+  Risk Score    : {risk}/100
+  Quality Score : {quality}/100
+  Security Score: {security}/100
+  Findings      : {len(findings)}
+  Old Hash      : {hashes.get('old_hash','')[:24]}...
+  New Hash      : {hashes.get('new_hash','')[:24]}...
+  Semantic Hash : {hashes.get('semantic_hash','')[:24]}...
+{pred_block}
 OLD CODE:
-{old_code[:600]}
+{old_code[:500]}
 
 NEW CODE:
-{new_code[:600]}
-══════════════════════════════════════════════
+{new_code[:500]}
 
-Respond with EXACTLY this JSON structure (no markdown, no extra keys):
+Respond ONLY with this exact JSON (no markdown, no extra keys):
 {{
   "technical_explanation": "2-3 sentences using AST/semantic analysis terminology",
-  "human_explanation": "2-3 sentences for a non-technical stakeholder, no jargon",
+  "human_explanation": "2-3 sentences for a non-technical stakeholder",
   "risk_reasoning": "1-2 sentences justifying the risk score",
   "behavioral_impact": "1-2 sentences on runtime/user-facing impact"
 }}"""
+        try:
+            raw, provider = _ai(prompt)
+            clean = raw.strip()
+            if clean.startswith("```"): clean = "\n".join(clean.split("\n")[1:])
+            if clean.endswith("```"):   clean = "\n".join(clean.split("\n")[:-1])
+            parsed = json.loads(clean.strip())
+            return {
+                "technical_explanation": str(parsed.get("technical_explanation", "")),
+                "human_explanation":     str(parsed.get("human_explanation", "")),
+                "risk_reasoning":        str(parsed.get("risk_reasoning", "")),
+                "behavioral_impact":     str(parsed.get("behavioral_impact", "")),
+                "ai_provider":           provider,
+            }
+        except Exception:
+            return {
+                "technical_explanation": "Analysis complete. Review findings.",
+                "human_explanation":     "Analysis complete. Review findings.",
+                "risk_reasoning":        "",
+                "behavioral_impact":     "",
+                "ai_provider":           "None",
+            }
 
-
-def parse_ai_explanation(raw: str) -> Dict[str, str]:
-    try:
-        clean = raw.strip()
-        if clean.startswith("```"):
-            clean = "\n".join(clean.split("\n")[1:])
-        if clean.endswith("```"):
-            clean = "\n".join(clean.split("\n")[:-1])
-        parsed = json.loads(clean.strip())
-        return {
-            "technical_explanation": str(parsed.get("technical_explanation", "")),
-            "human_explanation":     str(parsed.get("human_explanation", "")),
-            "risk_reasoning":        str(parsed.get("risk_reasoning", "")),
-            "behavioral_impact":     str(parsed.get("behavioral_impact", "")),
-        }
-    except Exception:
-        return {
-            "technical_explanation": raw[:500],
-            "human_explanation":     "Analysis completed. Please review technical findings.",
-            "risk_reasoning":        "",
-            "behavioral_impact":     "",
-        }
+    def realtime_explain(self, code: str, findings: List, risk: int, security: int) -> Dict[str, str]:
+        prompt = f"""You are CRONOS v8. Analyze this code fragment quickly.
+Risk: {risk}/100, Security: {security}/100, Issues: {len(findings)}
+CODE: {code[:400]}
+Return ONLY JSON:
+{{"technical_explanation":"...","human_explanation":"...","risk_reasoning":"...","behavioral_impact":"..."}}"""
+        try:
+            raw, provider = _ai(prompt)
+            clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
+            parsed = json.loads(clean)
+            return {**{k: str(parsed.get(k,"")) for k in ("technical_explanation","human_explanation","risk_reasoning","behavioral_impact")}, "ai_provider": provider}
+        except:
+            return {"technical_explanation":"","human_explanation":"","risk_reasoning":"","behavioral_impact":"","ai_provider":"None"}
 
 
 # ============================================================================
-# FULL ANALYSIS RUNNER — v8 (async + parallel + hash cache)
+# PR COMMENT FORMATTER (Feature 1)
 # ============================================================================
 
-async def run_full_analysis(old_code: str, new_code: str, mode: str = "STRICT") -> Dict[str, Any]:
-    loop = asyncio.get_event_loop()
+class PRCommentFormatter:
+    """Generates GitHub PR comment markdown and posts it via API."""
+
+    @staticmethod
+    def format(analysis: Dict[str, Any]) -> str:
+        sev   = analysis.get("severity", "UNKNOWN")
+        risk  = analysis.get("risk_score", analysis.get("risk", 0))
+        sec   = analysis.get("security_score", "N/A")
+        ovr   = analysis.get("overall_score", "N/A")
+        qual  = analysis.get("quality_score", "N/A")
+        status= analysis.get("status", "UNKNOWN")
+        beh   = analysis.get("behavior", {})
+        beh_c = beh.get("changed", False)
+        beh_s = beh.get("summary", "")
+        ep    = analysis.get("execution_prediction", {})
+        outs  = ep.get("possible_outputs", [])[:3]
+        excs  = ep.get("exceptions", [])[:3]
+        tech  = analysis.get("technical_explanation", "")
+        human = analysis.get("human_explanation", "")
+        rid   = analysis.get("report_id", "")
+
+        emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "SAFE": "🟢"}.get(sev, "⚪")
+        beh_line = "✅ No behavior change" if not beh_c else f"⚠️ **YES** — {beh_s}"
+        out_md   = "\n".join(f"- `{o}`" for o in outs) if outs else "_No explicit outputs_"
+        exc_md   = "\n".join(f"- ⚠️ `{e}`" for e in excs) if excs else "_None detected_"
+
+        return f"""## {emoji} CRONOS Intelligence Report — {sev}
+
+| Metric | Score |
+|---|---|
+| Risk Score | **{risk}/100** |
+| Security Score | **{sec}/100** |
+| Quality Score | **{qual}/100** |
+| Overall Score | **{ovr}/100** |
+| Status | **{status}** |
+| Severity | **{sev}** |
+
+### 🔄 Behavior Change Detection
+{beh_line}
+
+### ⚡ Execution Prediction
+**Possible Outputs:**
+{out_md}
+
+**Exception Risks:**
+{exc_md}
+
+### 🧠 Technical Explanation
+> {tech[:500] if tech else "_Unavailable_"}
+
+### 💬 Human Explanation
+> {human[:500] if human else "_Unavailable_"}
+
+---
+*Report ID: `{rid}`* | *Powered by [CRONOS](https://github.com/cythonvijay/cronos-action)*
+"""
+
+    @staticmethod
+    def post(token: str, owner: str, repo: str, pr_number: int, analysis: Dict) -> Optional[Dict]:
+        body    = PRCommentFormatter.format(analysis)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        }
+        url  = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+        resp = requests.post(url, headers=headers, json={"body": body}, timeout=30)
+        if resp.status_code in (200, 201):
+            return resp.json()
+        print(f"[CRONOS] PR comment failed: {resp.status_code} {resp.text[:200]}")
+        return None
+
+
+# ============================================================================
+# GITHUB CHECKS / ANNOTATIONS (Feature 2)
+# ============================================================================
+
+def _sev_to_level(sev: str) -> str:
+    return {"CRITICAL": "failure", "HIGH": "failure", "MEDIUM": "warning", "LOW": "notice", "SAFE": "notice"}.get(sev.upper(), "warning")
+
+def create_check_run(token: str, owner: str, repo: str, sha: str, analysis: Dict, filename: str) -> Optional[Dict]:
+    sev       = analysis.get("severity", "UNKNOWN")
+    risk      = analysis.get("risk_score", 0)
+    status    = analysis.get("status", "PASS")
+    conclusion = "success" if status == "PASS" else "failure" if status == "FAIL" else "neutral"
+    level     = _sev_to_level(sev)
+
+    annotations = []
+    for f in analysis.get("risk_findings", [])[:5]:
+        msgs = f.get("findings", [])
+        annotations.append({"path": filename, "start_line": 1, "end_line": 1,
+                             "annotation_level": level,
+                             "message": f"[CRONOS Risk] {msgs[0] if msgs else 'Issue detected'}",
+                             "title": f"Risk: {f.get('name', 'Finding')}"})
+    for sf in analysis.get("security_findings", [])[:5]:
+        sl = _sev_to_level(sf.get("severity", "medium"))
+        cwe = sf.get("cwe", "")
+        annotations.append({"path": filename, "start_line": 1, "end_line": 1,
+                             "annotation_level": sl,
+                             "message": f"[CRONOS Security] {sf.get('message','')[:200]}",
+                             "title": f"Security: {sf.get('type','Vuln')}{' ('+cwe+')' if cwe else ''}"})
+    for exc in analysis.get("execution_prediction", {}).get("exceptions", [])[:3]:
+        annotations.append({"path": filename, "start_line": 1, "end_line": 1,
+                             "annotation_level": "warning",
+                             "message": f"[CRONOS Execution] {exc}",
+                             "title": "Execution Risk"})
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json"}
+    payload = {
+        "name":       "CRONOS Intelligence",
+        "head_sha":   sha,
+        "status":     "completed",
+        "conclusion": conclusion,
+        "output": {
+            "title":       f"CRONOS — {sev} | Risk {risk}/100 | {status}",
+            "summary":     f"**Severity:** {sev}  \n**Risk:** {risk}/100  \n**Security:** {analysis.get('security_score','N/A')}/100  \n**Overall:** {analysis.get('overall_score','N/A')}/100",
+            "text":        f"### Technical\n{analysis.get('technical_explanation','')[:800]}\n\n### Human\n{analysis.get('human_explanation','')[:800]}",
+            "annotations": annotations[:50],
+        },
+    }
+    url  = f"https://api.github.com/repos/{owner}/{repo}/check-runs"
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    if resp.status_code in (200, 201):
+        return resp.json()
+    print(f"[CRONOS] Check run failed: {resp.status_code}")
+    return None
+
+
+# ============================================================================
+# METADATA STORE (Feature 4 — zero code retention)
+# ============================================================================
+
+class MetadataStore:
+    """SQLite-backed store. NEVER stores source code."""
+
+    @staticmethod
+    def save(report_id: str, repo: str, file: str, timestamp: str,
+             risk_score: int, security_score: int, overall_score: int,
+             severity: str, old_hash: str, new_hash: str, semantic_hash: str,
+             mode: str, status: str) -> None:
+        try:
+            with _db_conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO reports VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (report_id, repo, file, timestamp, risk_score, security_score,
+                     overall_score, severity, old_hash, new_hash, semantic_hash, mode, status),
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"⚠️ MetadataStore.save: {e}")
+
+    @staticmethod
+    def history(repo: str, limit: int = 100) -> List[Dict]:
+        try:
+            with _db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM reports WHERE repo=? ORDER BY timestamp DESC LIMIT ?", (repo, limit)
+                ).fetchall()
+            return [dict(r) for r in rows]
+        except: return []
+
+    @staticmethod
+    def trend(repo: str, limit: int = 30) -> Dict:
+        h = MetadataStore.history(repo, limit)
+        if not h: return {"repo": repo, "entries": [], "averages": {}}
+        entries = [{"timestamp": r["timestamp"], "risk_score": r["risk_score"],
+                    "security_score": r["security_score"], "overall_score": r["overall_score"],
+                    "severity": r["severity"], "file": r["file"]} for r in h]
+        n = len(entries)
+        return {
+            "repo": repo, "entries": entries, "count": n,
+            "averages": {
+                "risk_score":    round(sum(e["risk_score"]    for e in entries) / n, 1),
+                "security_score": round(sum(e["security_score"] for e in entries) / n, 1),
+                "overall_score": round(sum(e["overall_score"] for e in entries) / n, 1),
+            },
+        }
+
+    @staticmethod
+    def summary() -> Dict:
+        try:
+            with _db_conn() as conn:
+                total = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+                sevs  = {r["severity"]: r["cnt"] for r in
+                         conn.execute("SELECT severity, COUNT(*) as cnt FROM reports GROUP BY severity").fetchall()}
+                avg   = conn.execute("SELECT AVG(risk_score) r, AVG(security_score) s, AVG(overall_score) o FROM reports").fetchone()
+            return {"total_reports": total, "severity_counts": sevs,
+                    "averages": {"risk_score": round(avg["r"] or 0, 1), "security_score": round(avg["s"] or 0, 1), "overall_score": round(avg["o"] or 0, 1)}}
+        except: return {"total_reports": 0, "severity_counts": {}, "averages": {}}
+
+    @staticmethod
+    def recent(limit: int = 20) -> List[Dict]:
+        try:
+            with _db_conn() as conn:
+                return [dict(r) for r in conn.execute("SELECT * FROM reports ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()]
+        except: return []
+
+    @staticmethod
+    def high_risk(threshold: int = 60, limit: int = 50) -> List[Dict]:
+        try:
+            with _db_conn() as conn:
+                return [dict(r) for r in conn.execute(
+                    "SELECT * FROM reports WHERE risk_score>=? ORDER BY risk_score DESC, timestamp DESC LIMIT ?",
+                    (threshold, limit)).fetchall()]
+        except: return []
+
+
+# ============================================================================
+# CORE ANALYSIS RUNNER
+# ============================================================================
+
+_intel = IntelligenceEngine()
+_qual  = CodeQualityAnalyzer()
+_sec   = SecurityAnalyzer()
+_pred  = ExecutionPredictor()
+_ai_ex = AIExplainer()
+
+async def run_full_analysis(
+    old_code: str, new_code: str, mode: str = "STRICT",
+    repo: str = "", file: str = "",
+) -> Dict[str, Any]:
+    loop      = asyncio.get_event_loop()
     report_id = str(uuid.uuid4())
     timestamp = datetime.utcnow().isoformat() + "Z"
 
-    hashes        = compute_hashes(old_code, new_code)
+    # 1. Hashes
+    hashes        = HashEngine.compute(old_code, new_code)
     old_hash      = hashes["old_hash"]
     new_hash      = hashes["new_hash"]
     semantic_hash = hashes["semantic_hash"]
 
+    # 2. Cache check — store only scores, rebuild full response on hit
     cache_key = f"{semantic_hash}:{mode}"
     if cache_key in HASH_CACHE:
-        cached = HASH_CACHE[cache_key].copy()
-        cached["report_id"] = report_id
-        cached["timestamp"] = timestamp
-        cached["cache_hit"] = True
+        scores = HASH_CACHE[cache_key]
+        cached = {
+            "status":          RiskEngine.status(scores["risk_score"]),
+            "risk":            scores["risk_score"],
+            "risk_score":      scores["risk_score"],
+            "quality_score":   scores["quality_score"],
+            "security_score":  scores["security_score"],
+            "overall_score":   scores["overall_score"],
+            "severity":        scores["severity"],
+            "mode":            mode,
+            "old_hash":        old_hash,
+            "new_hash":        new_hash,
+            "semantic_hash":   semantic_hash,
+            "pass":  RiskEngine.status(scores["risk_score"]) == "PASS",
+            "warn":  RiskEngine.status(scores["risk_score"]) == "WARN",
+            "fail":  RiskEngine.status(scores["risk_score"]) == "FAIL",
+            "report_id":  report_id,
+            "timestamp":  timestamp,
+            "cache_hit":  True,
+            "download_urls": {
+                "json":  f"/report/json/{report_id}",
+                "pdf":   f"/report/pdf/{report_id}",
+                "store": f"/report/store/{report_id}",
+            },
+        }
         REPORT_STORE[report_id] = cached
-        _persist_report(report_id, cached)
         return cached
 
-    if mode == "STRICT":
-        constraints = Constraint(no_behavior_change=True, allow_boundary_change=False)
-    elif mode == "BOUNDARY":
-        constraints = Constraint(no_behavior_change=False, allow_boundary_change=True)
-    else:
-        constraints = Constraint(no_behavior_change=False, allow_boundary_change=False)
+    # 3. Constraints
+    constraints = {
+        "STRICT":   Constraint(no_behavior_change=True,  allow_boundary_change=False),
+        "BOUNDARY": Constraint(no_behavior_change=False, allow_boundary_change=True),
+    }.get(mode, Constraint(no_behavior_change=False, allow_boundary_change=False))
 
-    def _run_risk():
-        if old_code.strip():
-            return ChangeAnalyzer().analyze(old_code, new_code, constraints)
-        return ComplianceAnalyzer().analyze(new_code, "")
+    # 4. Parallel analysis
+    def _risk():
+        return _intel.analyze_change(old_code, new_code, constraints) if old_code.strip() \
+               else _intel.analyze_compliance(new_code, "")
+    def _quality():   return _qual.analyze(new_code)
+    def _security():  return _sec.analyze(new_code)
+    def _prediction(): return _pred.predict(new_code)
+    def _behavior():  return _intel.compare_behavior(old_code, new_code)
 
-    def _run_quality():
-        return CodeQualityAnalyzer().analyze(new_code)
-
-    def _run_security():
-        return SecurityAnalyzer().analyze(new_code)
-
-    def _run_prediction():
-        return ExecutionPredictor().predict(new_code)
-
-    def _run_behavior():
-        return BehaviorSimulator().compare(old_code, new_code)
-
-    (risk_result, quality_result, security_result,
-     prediction_result, behavior_result) = await asyncio.gather(
-        loop.run_in_executor(_EXECUTOR, _run_risk),
-        loop.run_in_executor(_EXECUTOR, _run_quality),
-        loop.run_in_executor(_EXECUTOR, _run_security),
-        loop.run_in_executor(_EXECUTOR, _run_prediction),
-        loop.run_in_executor(_EXECUTOR, _run_behavior),
+    (risk_res, qual_res, sec_res, pred_res, beh_res) = await asyncio.gather(
+        loop.run_in_executor(_EXECUTOR, _risk),
+        loop.run_in_executor(_EXECUTOR, _quality),
+        loop.run_in_executor(_EXECUTOR, _security),
+        loop.run_in_executor(_EXECUTOR, _prediction),
+        loop.run_in_executor(_EXECUTOR, _behavior),
     )
 
-    risk_findings, raw_risk, risk_signals = risk_result
-    quality_score, quality_issues          = quality_result
-    security_score, security_findings      = security_result
-    execution_prediction                   = prediction_result
-    behavior                               = behavior_result
+    risk_findings, raw_risk, risk_signals = risk_res
+    quality_score,  quality_issues        = qual_res
+    security_score, sec_findings          = sec_res
+    exec_pred                             = pred_res
+    behavior                              = beh_res
 
-    risk_score     = normalize_risk(raw_risk)
-    status         = get_status(risk_score)
-    behavior_score = behavior.get("behavior_score", 100)
-    overall_score  = compute_overall_score(raw_risk, quality_score, security_score, behavior_score)
-    risk_summary   = [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No risk issues detected"]
+    risk_score    = RiskEngine.normalize(raw_risk)
+    status        = RiskEngine.status(risk_score)
+    behavior_score= behavior.get("behavior_score", 100)
+    overall_score = RiskEngine.overall(raw_risk, quality_score, security_score, behavior_score)
+    severity      = RiskEngine.classify_severity(risk_score, security_score, behavior.get("changed", False), exec_pred)
 
-    exec_pred_for_ai = {
-        "possible_outputs": execution_prediction.get("possible_outputs", []),
-        "exceptions":       execution_prediction.get("exceptions", []),
-        "confidence":       execution_prediction.get("confidence", 0.0),
-    }
-    try:
-        raw_ai, ai_provider = await loop.run_in_executor(
-            _EXECUTOR,
-            ai,
-            semantic_explanation_prompt(
-                old_code, new_code, risk_findings,
-                risk_score, quality_score, security_score,
-                hashes, exec_pred_for_ai
-            )
-        )
-        ai_fields = parse_ai_explanation(raw_ai)
-    except Exception:
-        ai_fields = {
-            "technical_explanation": "AI explanation unavailable.",
-            "human_explanation":     "Analysis completed. Please review findings.",
-            "risk_reasoning":        "",
-            "behavioral_impact":     "",
-        }
-        ai_provider = "None"
+    # 5. AI explanation
+    def _explain():
+        return _ai_ex.explain(old_code, new_code, risk_findings, risk_score,
+                               quality_score, security_score, hashes,
+                               {"possible_outputs": exec_pred.get("possible_outputs", []),
+                                "exceptions": exec_pred.get("exceptions", []),
+                                "confidence": exec_pred.get("confidence", 0)})
+    ai_fields = await loop.run_in_executor(_EXECUTOR, _explain)
 
+    # 6. Assemble — ZERO CODE RETENTION: source code never stored
     result = {
-        "status":     status,
-        "risk":       risk_score,
-        "risk_score": risk_score,
-        "severity":   compute_severity(risk_score),
-        "mode":       mode,
+        "status":     status, "risk": risk_score, "risk_score": risk_score, "mode": mode,
+        "quality_score": quality_score, "security_score": security_score,
+        "overall_score": overall_score, "behavior_score": behavior_score,
+        "severity": severity,
+        "old_hash": old_hash, "new_hash": new_hash, "semantic_hash": semantic_hash,
+        "execution_prediction": {
+            "possible_outputs": exec_pred.get("possible_outputs", []),
+            "return_values":    exec_pred.get("return_values", []),
+            "print_outputs":    exec_pred.get("print_outputs", []),
+            "branches":         exec_pred.get("branches", []),
+            "state_changes":    exec_pred.get("state_changes", []),
+            "exceptions":       exec_pred.get("exceptions", []),
+            "auth_outcomes":    exec_pred.get("auth_outcomes", []),
+            "confidence":       exec_pred.get("confidence", 0.0),
+            "execution_paths":  exec_pred.get("execution_paths", 1),
+        },
+        "behavior": {"changed": behavior.get("changed", False), "summary": behavior.get("summary", ""), "changes": behavior.get("changes", [])},
+        "technical_explanation": ai_fields.get("technical_explanation", ""),
+        "human_explanation":     ai_fields.get("human_explanation", ""),
+        "risk_reasoning":        ai_fields.get("risk_reasoning", ""),
+        "behavioral_impact":     ai_fields.get("behavioral_impact", ""),
+        "ai_provider":           ai_fields.get("ai_provider", "None"),
+        "summary":        [f.findings[0] for f in risk_findings[:5]] if risk_findings else ["No issues"],
+        "findings_count": len(risk_findings),
+        "risk_findings":  [f.dict() for f in risk_findings],
+        "quality_findings": quality_issues,
+        "security_findings": sec_findings,
+        "pass": status == "PASS", "warn": status == "WARN", "fail": status == "FAIL",
+        "metadata": risk_signals,
+        "report_id": report_id, "timestamp": timestamp, "cache_hit": False,
+        "download_urls": {
+            "json": f"/report/json/{report_id}",
+            "pdf":  f"/report/pdf/{report_id}",
+            "store": f"/report/store/{report_id}",
+        },
+    }
 
+    # 7. Store metadata (no source code)
+    # Cache stores ONLY scores — no explanations, findings, or metadata.
+    # Keeps HASH_CACHE lean: O(5 ints) per entry instead of O(N KB).
+    HASH_CACHE[cache_key] = {
+        "risk_score":     risk_score,
+        "severity":       severity,
+        "overall_score":  overall_score,
         "quality_score":  quality_score,
         "security_score": security_score,
-        "overall_score":  overall_score,
-        "behavior_score": behavior_score,
-
-        "old_hash":      old_hash,
-        "new_hash":      new_hash,
-        "semantic_hash": semantic_hash,
-
-        "execution_prediction": {
-            "possible_outputs": execution_prediction.get("possible_outputs", []),
-            "return_values":    execution_prediction.get("return_values", []),
-            "print_outputs":    execution_prediction.get("print_outputs", []),
-            "branches":         execution_prediction.get("branches", []),
-            "state_changes":    execution_prediction.get("state_changes", []),
-            "exceptions":       execution_prediction.get("exceptions", []),
-            "auth_outcomes":    execution_prediction.get("auth_outcomes", []),
-            "confidence":       execution_prediction.get("confidence", 0.0),
-            "execution_paths":  execution_prediction.get("execution_paths", 1),
-        },
-
-        "behavior": {
-            "changed": behavior.get("changed", False),
-            "summary": behavior.get("summary", ""),
-            "changes": behavior.get("changes", []),
-        },
-
-        "technical_explanation": ai_fields["technical_explanation"],
-        "human_explanation":     ai_fields["human_explanation"],
-        "risk_reasoning":        ai_fields["risk_reasoning"],
-        "behavioral_impact":     ai_fields["behavioral_impact"],
-        "ai_provider":           ai_provider,
-
-        "summary":           risk_summary,
-        "findings_count":    len(risk_findings),
-        "risk_findings":     [f.dict() for f in risk_findings],
-        "quality_findings":  quality_issues,
-        "security_findings": security_findings,
-
-        "pass": status == "PASS",
-        "warn": status == "WARN",
-        "fail": status == "FAIL",
-
-        "metadata":  risk_signals,
-        "report_id": report_id,
-        "timestamp": timestamp,
-        "cache_hit": False,
     }
-
-    HASH_CACHE[cache_key] = result.copy()
     REPORT_STORE[report_id] = result
-    _persist_report(report_id, result)
+
+    MetadataStore.save(
+        report_id, repo, file, timestamp,
+        risk_score, security_score, overall_score,
+        severity, old_hash, new_hash, semantic_hash,
+        mode, status,
+    )
+
+    # Persist safe JSON report (no source code)
+    safe = {k: v for k, v in result.items()}
+    try:
+        with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding="utf-8") as fh:
+            json.dump(safe, fh, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ persist: {e}")
+
+    # ZERO CODE RETENTION — delete source from local scope immediately
+    del old_code, new_code
 
     return result
-
-
-def _persist_report(report_id: str, data: Dict) -> None:
-    try:
-        with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"⚠️ Report persist failed: {e}")
 
 
 # ============================================================================
 # PDF GENERATION
 # ============================================================================
 
-def generate_professional_pdf(data: Dict) -> BytesIO:
-    buffer = BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    y = height - 0.5*inch
+def _generate_pdf(data: Dict) -> BytesIO:
+    buf = BytesIO()
+    c   = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4; y = h - 0.5*inch
 
     c.setFont("Helvetica-Bold", 20)
-    c.drawString(0.5*inch, y, "CRONOS Intelligence Analysis Report")
-    y -= 0.3*inch
+    c.drawString(0.5*inch, y, "CRONOS v8 — Intelligence Analysis Report"); y -= 0.3*inch
     c.setFont("Helvetica", 10)
-    c.drawString(0.5*inch, y, f"Generated: {data.get('timestamp', 'N/A')}")
-    y -= 0.4*inch
+    c.drawString(0.5*inch, y, f"Generated: {data.get('timestamp','N/A')}  |  Report: {data.get('report_id','N/A')}"); y -= 0.4*inch
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(0.5*inch, y, "Analysis Summary")
-    y -= 0.25*inch
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(0.5*inch, y, "Scores"); y -= 0.22*inch
     c.setFont("Helvetica", 11)
-    metadata = [
-        f"Mode: {data.get('mode', 'N/A')}",
-        f"Status: {data.get('status', 'N/A')}",
-        f"Risk Score: {data.get('risk_score', data.get('risk', 0))}/100",
-        f"Quality Score: {data.get('quality_score', 'N/A')}/100",
-        f"Security Score: {data.get('security_score', 'N/A')}/100",
-        f"Overall Score: {data.get('overall_score', 'N/A')}/100",
-        f"Report ID: {data.get('report_id', 'N/A')}",
-    ]
-    for item in metadata:
-        c.drawString(0.75*inch, y, item)
-        y -= 0.2*inch
+    for label, key in [("Risk Score", "risk_score"), ("Quality Score", "quality_score"),
+                       ("Security Score", "security_score"), ("Overall Score", "overall_score"),
+                       ("Severity", "severity"), ("Status", "status"), ("Mode", "mode")]:
+        c.drawString(0.75*inch, y, f"{label}: {data.get(key, 'N/A')}")
+        y -= 0.18*inch
 
-    old_h = data.get('old_hash', '')
-    new_h = data.get('new_hash', '')
-    sem_h = data.get('semantic_hash', '')
-    if any([old_h, new_h, sem_h]):
-        y -= 0.1*inch
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(0.5*inch, y, "Integrity Hashes")
-        y -= 0.2*inch
-        c.setFont("Courier", 9)
-        if old_h: c.drawString(0.75*inch, y, f"Old Hash      : {old_h[:32]}..."); y -= 0.18*inch
-        if new_h: c.drawString(0.75*inch, y, f"New Hash      : {new_h[:32]}..."); y -= 0.18*inch
-        if sem_h: c.drawString(0.75*inch, y, f"Semantic Hash : {sem_h[:32]}..."); y -= 0.18*inch
-        c.setFont("Helvetica", 11)
+    for h_label, hash_key in [("Old Hash", "old_hash"), ("New Hash", "new_hash"), ("Semantic Hash", "semantic_hash")]:
+        val = data.get(hash_key, "")
+        if val:
+            c.setFont("Courier", 9)
+            c.drawString(0.75*inch, y, f"{h_label}: {val[:48]}...")
+            y -= 0.16*inch
+    c.setFont("Helvetica", 11)
 
-    y -= 0.2*inch
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(0.5*inch, y, "Key Findings")
-    y -= 0.25*inch
+    y -= 0.15*inch; c.setFont("Helvetica-Bold", 13); c.drawString(0.5*inch, y, "Key Findings"); y -= 0.22*inch
     c.setFont("Helvetica", 10)
-    findings = data.get('analyzer_findings', data.get('risk_findings', []))
-    if findings:
-        for i, finding in enumerate(findings[:8], 1):
-            finding_text = finding.get('findings', ['No description'])[0]
-            risk_score = finding.get('risk', 0)
-            words = finding_text.split()
-            lines = []; current_line = []
-            for word in words:
-                test_line = ' '.join(current_line + [word])
-                if c.stringWidth(test_line, "Helvetica", 10) < (width - 1.5*inch):
-                    current_line.append(word)
-                else:
-                    if current_line: lines.append(' '.join(current_line))
-                    current_line = [word]
-            if current_line: lines.append(' '.join(current_line))
-            c.drawString(0.75*inch, y, f"• {lines[0]}")
-            y -= 0.18*inch
-            for line in lines[1:]:
-                c.drawString(0.95*inch, y, line); y -= 0.18*inch
-            c.setFont("Helvetica-Oblique", 9)
-            c.drawString(0.95*inch, y, f"Risk: {risk_score}/100"); y -= 0.25*inch
-            c.setFont("Helvetica", 10)
-            if y < 1*inch:
-                c.showPage(); y = height - 0.5*inch
-    else:
-        c.drawString(0.75*inch, y, "• No issues detected"); y -= 0.3*inch
-
-    sec_findings = data.get('security_findings', [])
-    if sec_findings:
-        if y < 3*inch: c.showPage(); y = height - 0.5*inch
-        y -= 0.2*inch
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(0.5*inch, y, "Security Findings")
-        y -= 0.25*inch
+    for finding in (data.get("risk_findings") or [])[:8]:
+        msg  = (finding.get("findings") or [""])[0]
+        risk = finding.get("risk", 0)
+        words = msg.split(); line = ""; lines_out = []
+        for word in words:
+            test = (line + " " + word).strip()
+            if c.stringWidth(test, "Helvetica", 10) < (w - 1.5*inch): line = test
+            else: lines_out.append(line); line = word
+        if line: lines_out.append(line)
+        c.drawString(0.75*inch, y, f"• {lines_out[0] if lines_out else msg[:80]}"); y -= 0.17*inch
+        for ln in lines_out[1:]: c.drawString(0.95*inch, y, ln); y -= 0.17*inch
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawString(0.95*inch, y, f"Risk: {risk}/100"); y -= 0.22*inch
         c.setFont("Helvetica", 10)
-        for sf in sec_findings[:5]:
-            msg = sf.get('message', '')[:100]
-            sev = sf.get('severity', 'unknown')
-            c.drawString(0.75*inch, y, f"• [{sev.upper()}] {msg}")
-            y -= 0.2*inch
-            if y < 1*inch: c.showPage(); y = height - 0.5*inch
+        if y < 1*inch: c.showPage(); y = h - 0.5*inch
 
-    if y < 3*inch: c.showPage(); y = height - 0.5*inch
-    y -= 0.2*inch
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(0.5*inch, y, "Technical / Semantic Explanation")
-    y -= 0.25*inch
+    if y < 3*inch: c.showPage(); y = h - 0.5*inch
+    y -= 0.15*inch; c.setFont("Helvetica-Bold", 13); c.drawString(0.5*inch, y, "Technical Explanation"); y -= 0.22*inch
     c.setFont("Helvetica", 9)
-    tech = (data.get('semantic_explanation') or data.get('technical_explanation', 'No explanation available'))[:600]
-    words = tech.split(); lines = []; current_line = []
-    for word in words:
-        test_line = ' '.join(current_line + [word])
-        if c.stringWidth(test_line, "Helvetica", 9) < (width - 1.5*inch):
-            current_line.append(word)
-        else:
-            if current_line: lines.append(' '.join(current_line))
-            current_line = [word]
-    if current_line: lines.append(' '.join(current_line))
-    for line in lines[:20]:
+    for line in _wrap(data.get("technical_explanation","N/A")[:600], c, w - 1.5*inch, "Helvetica", 9)[:20]:
         c.drawString(0.75*inch, y, line); y -= 0.15*inch
         if y < 0.5*inch: break
 
     c.setFont("Helvetica-Oblique", 8)
-    c.drawString(0.5*inch, 0.5*inch, "CRONOS v8.0.0 - Advanced Intelligence Code Analysis")
-    c.drawString(width - 2*inch, 0.5*inch, "Page 1")
-    c.save()
-    buffer.seek(0)
-    return buffer
+    c.drawString(0.5*inch, 0.4*inch, "CRONOS v8.0.0 — Enterprise Intelligence Code Analyzer")
+    c.save(); buf.seek(0)
+    return buf
+
+def _wrap(text, c, max_w, font, size):
+    words = text.split(); line = ""; lines = []
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, font, size) < max_w: line = test
+        else: lines.append(line); line = w
+    if line: lines.append(line)
+    return lines
 
 
 # ============================================================================
-# ENDPOINTS — ORIGINAL (PRESERVED)
+# ███████╗███╗   ██╗██████╗ ██████╗  ██████╗ ██╗███╗   ██╗████████╗███████╗
+# ██╔════╝████╗  ██║██╔══██╗██╔══██╗██╔═══██╗██║████╗  ██║╚══██╔══╝██╔════╝
+# █████╗  ██╔██╗ ██║██║  ██║██████╔╝██║   ██║██║██╔██╗ ██║   ██║   ███████╗
+# ██╔══╝  ██║╚██╗██║██║  ██║██╔═══╝ ██║   ██║██║██║╚██╗██║   ██║   ╚════██║
+# ███████╗██║ ╚████║██████╔╝██║     ╚██████╔╝██║██║ ╚████║   ██║   ███████║
+# ╚══════╝╚═╝  ╚═══╝╚═════╝ ╚═╝      ╚═════╝ ╚═╝╚═╝  ╚═══╝   ╚═╝   ╚══════╝
 # ============================================================================
 
+# ── POST /analyze_full ───────────────────────────────────────────────────────
+@app.post("/analyze_full")
+async def analyze_full(req: FullAnalyzeRequest):
+    """
+    Full 6-layer enterprise intelligence report.
+    Features: severity classification, DB storage, PR comment formatting,
+    check run annotations, history tracking, dashboard data.
+    Target: < 5 seconds.
+    """
+    try:
+        result = await run_full_analysis(req.old_code, req.new_code, req.mode, req.repo, req.file)
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Analysis error: {e}")
+
+
+# ── POST /analyze_realtime (Feature 6 — IDE plugin) ─────────────────────────
+@app.post("/analyze_realtime")
+async def analyze_realtime(req: RealtimeAnalyzeRequest):
+    """
+    Realtime IDE plugin endpoint. Target: < 2 seconds.
+    Input: { "code": "...", "filename": "..." }
+    """
+    import time; t0 = time.time()
+    code     = req.code
+    filename = req.filename
+    loop     = asyncio.get_event_loop()
+
+    def _run_all():
+        quality,  qi = _qual.analyze(code)
+        security, si = _sec.analyze(code)
+        pred         = _pred.predict(code)
+        risk_score   = 0
+        # Quick risk estimate from security findings
+        sev_w = {"critical": 30, "high": 15, "medium": 8, "low": 3}
+        penalty = sum(sev_w.get(f.get("severity","low"), 3) for f in si)
+        risk_score = min(100, penalty)
+        risk_score = RiskEngine.normalize(risk_score)
+        severity   = RiskEngine.classify_severity(risk_score, security, False, pred)
+        return quality, qi, security, si, pred, risk_score, severity
+
+    quality, qi, security, si, pred, risk_score, severity = await loop.run_in_executor(_EXECUTOR, _run_all)
+
+    def _explain_rt():
+        return _ai_ex.realtime_explain(code, si, risk_score, security)
+    ai = await loop.run_in_executor(_EXECUTOR, _explain_rt)
+
+    elapsed = round(time.time() - t0, 3)
+
+    result = {
+        "filename": filename,
+        "risk_score": risk_score,
+        "security_score": security,
+        "quality_score": quality,
+        "overall_score": RiskEngine.overall(risk_score, quality, security, 100),
+        "severity": severity,
+        "status": RiskEngine.status(risk_score),
+        "execution_prediction": {
+            "possible_outputs": pred.get("possible_outputs", []),
+            "exceptions": pred.get("exceptions", []),
+            "confidence": pred.get("confidence", 0),
+        },
+        "security_findings": si[:10],
+        "quality_findings": qi[:10],
+        "technical_explanation": ai.get("technical_explanation",""),
+        "human_explanation":     ai.get("human_explanation",""),
+        "risk_reasoning":        ai.get("risk_reasoning",""),
+        "behavioral_impact":     ai.get("behavioral_impact",""),
+        "ai_provider":           ai.get("ai_provider","None"),
+        "elapsed_seconds": elapsed,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+    # Zero code retention
+    del code
+    return result
+
+
+# ── GET /history/{repo} (Feature 4) ─────────────────────────────────────────
+@app.get("/history/{repo}")
+async def get_history(repo: str, limit: int = 100):
+    return MetadataStore.history(repo, limit)
+
+
+# ── GET /trend/{repo} (Feature 4) ───────────────────────────────────────────
+@app.get("/trend/{repo}")
+async def get_trend(repo: str, limit: int = 30):
+    return MetadataStore.trend(repo, limit)
+
+
+# ── GET /dashboard/summary (Feature 5) ──────────────────────────────────────
+@app.get("/dashboard/summary")
+async def dashboard_summary():
+    return MetadataStore.summary()
+
+
+# ── GET /dashboard/recent (Feature 5) ───────────────────────────────────────
+@app.get("/dashboard/recent")
+async def dashboard_recent(limit: int = 20):
+    return MetadataStore.recent(limit)
+
+
+# ── GET /dashboard/high_risk (Feature 5) ────────────────────────────────────
+@app.get("/dashboard/high_risk")
+async def dashboard_high_risk(threshold: int = 60, limit: int = 50):
+    return MetadataStore.high_risk(threshold, limit)
+
+
+# ── POST /github/pr_comment (Feature 1 — server-side posting) ───────────────
+@app.post("/github/pr_comment")
+async def post_pr_comment(request: Request):
+    """
+    Post PR comment from server side.
+    Body: { "report_id": "...", "pr_number": 42, "owner": "...", "repo": "...", "github_token": "..." }
+    """
+    body = await request.json()
+    rid  = body.get("report_id")
+    if rid not in REPORT_STORE:
+        path = f"{REPORT_DIR}/{rid}.json"
+        if not os.path.exists(path):
+            raise HTTPException(404, f"Report not found: {rid}")
+        with open(path, encoding="utf-8") as fh:
+            analysis = json.load(fh)
+    else:
+        analysis = REPORT_STORE[rid]
+
+    token = body.get("github_token") or os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "github_token required")
+
+    result = PRCommentFormatter.post(
+        token, body.get("owner",""), body.get("repo",""), body.get("pr_number", 0), analysis
+    )
+    return {"success": result is not None, "comment": result}
+
+
+# ── POST /github/check_run (Feature 2 — server-side annotations) ─────────────
+@app.post("/github/check_run")
+async def post_check_run(request: Request):
+    """
+    Create GitHub Check Run with inline annotations.
+    Body: { "report_id": "...", "sha": "...", "owner": "...", "repo": "...", "filename": "...", "github_token": "..." }
+    """
+    body = await request.json()
+    rid  = body.get("report_id")
+    if rid not in REPORT_STORE:
+        path = f"{REPORT_DIR}/{rid}.json"
+        if not os.path.exists(path):
+            raise HTTPException(404, f"Report not found: {rid}")
+        with open(path, encoding="utf-8") as fh:
+            analysis = json.load(fh)
+    else:
+        analysis = REPORT_STORE[rid]
+
+    token = body.get("github_token") or os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise HTTPException(400, "github_token required")
+
+    result = create_check_run(
+        token, body.get("owner",""), body.get("repo",""),
+        body.get("sha",""), analysis, body.get("filename", "unknown.py"),
+    )
+    return {"success": result is not None, "check_run": result}
+
+
+# ── ORIGINAL /analyze and /analyze_ci (preserved) ───────────────────────────
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
-    mode = req.mode
-    report_id = str(uuid.uuid4())
-
+    mode = req.mode; report_id = str(uuid.uuid4())
     try:
         if mode == "CHANGE":
-            old_code = req.get_old_code()
-            new_code = req.get_new_code()
-            if not old_code.strip():
-                raise HTTPException(400, "old_code is required for CHANGE mode")
-            if not new_code.strip():
-                raise HTTPException(400, "new_code is required for CHANGE mode")
-
-            analyzer = ChangeAnalyzer()
-            findings, raw_risk, signals = analyzer.analyze(old_code, new_code, req.constraints)
-            risk = normalize_risk(raw_risk)
-            status = pass_fail_from_risk(risk)
-
-            quality_score, quality_issues = CodeQualityAnalyzer().analyze(new_code)
-            security_score, security_findings = SecurityAnalyzer().analyze(new_code)
-            behavior = BehaviorSimulator().compare(old_code, new_code)
-            overall_score = compute_overall_score(risk, quality_score, security_score, behavior.get("behavior_score", 100))
-
-            if req.enable_deep_analysis:
-                try:
-                    tech, provider = ai(comprehensive_analysis_prompt(old_code, new_code))
-                except Exception:
-                    tech, provider = ai(technical_prompt(mode, signals, findings, risk, req.technical_depth))
-            else:
-                tech, provider = ai(technical_prompt(mode, signals, findings, risk, req.technical_depth))
-
-            try:
-                human, _ = ai(human_prompt(findings, risk))
-            except Exception:
-                human = "Analysis completed. Please review technical findings."
-
+            old_code = req.get_old_code(); new_code = req.get_new_code()
+            if not old_code.strip(): raise HTTPException(400, "old_code required")
+            if not new_code.strip(): raise HTTPException(400, "new_code required")
+            findings, raw_risk, signals = _intel.analyze_change(old_code, new_code, req.constraints)
+            risk = RiskEngine.normalize(raw_risk); status = RiskEngine.status(risk)
+            quality, qi = _qual.analyze(new_code); security, si = _sec.analyze(new_code)
+            behavior     = _intel.compare_behavior(old_code, new_code)
+            overall      = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score",100))
+            tech, prov   = _ai(f"Mode=CHANGE Risk={risk} Findings={len(findings)} — explain in 100 words")
             result = {
-                "mode": "CHANGE",
-                "status": status,
-                "severity": compute_severity(risk),
-                "risk_score": risk,
-                "quality_score": quality_score,
-                "security_score": security_score,
-                "overall_score": overall_score,
+                "mode": mode, "status": status, "risk_score": risk, "quality_score": quality,
+                "security_score": security, "overall_score": overall,
+                "severity": RiskEngine.classify_severity(risk, security, behavior.get("changed",False), {}),
                 "analyzer_findings": [f.dict() for f in findings],
-                "quality_findings": quality_issues,
-                "security_findings": security_findings,
+                "quality_findings": qi, "security_findings": si,
                 "behavior": {"changed": behavior["changed"], "summary": behavior["summary"]},
-                "semantic_signals": signals,
-                "technical_explanation": tech,
-                "human_explanation": human,
-                "ai_provider": provider,
-                "technical_depth": req.technical_depth,
-                "deep_analysis_enabled": req.enable_deep_analysis,
-                "constraints_applied": req.constraints.dict(),
-                "report_id": report_id,
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "technical_explanation": tech, "ai_provider": prov,
+                "report_id": report_id, "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-
         elif mode == "COMPLIANCE":
-            if not req.source_code.strip():
-                raise HTTPException(400, "source_code is required for COMPLIANCE mode")
-            analyzer = ComplianceAnalyzer()
-            findings, raw_risk, signals = analyzer.analyze(req.source_code, req.expected_output)
-            risk = normalize_risk(raw_risk)
-            status = pass_fail_from_risk(risk)
-
-            quality_score, quality_issues = CodeQualityAnalyzer().analyze(req.source_code)
-            security_score, security_findings = SecurityAnalyzer().analyze(req.source_code)
-            overall_score = compute_overall_score(risk, quality_score, security_score, 100)
-
-            try:
-                tech, provider = ai(technical_prompt(mode, signals, findings, risk, req.technical_depth))
-                solution, _ = ai(compliance_solution_prompt(signals["source_hash"], req.expected_output, risk))
-            except Exception:
-                tech = "Analysis completed."; solution = "Verify code matches expected behavior."; provider = "None"
-
+            if not req.source_code.strip(): raise HTTPException(400, "source_code required")
+            findings, raw_risk, signals = _intel.analyze_compliance(req.source_code, req.expected_output)
+            risk = RiskEngine.normalize(raw_risk); status = RiskEngine.status(risk)
+            quality, qi = _qual.analyze(req.source_code); security, si = _sec.analyze(req.source_code)
+            overall = RiskEngine.overall(risk, quality, security, 100)
+            tech, prov = _ai(f"Compliance risk={risk} similarity analysis — explain in 80 words")
             result = {
-                "mode": "COMPLIANCE",
-                "status": status,
-                "severity": compute_severity(risk),
-                "risk_score": risk,
-                "quality_score": quality_score,
-                "security_score": security_score,
-                "overall_score": overall_score,
+                "mode": mode, "status": status, "risk_score": risk, "quality_score": quality,
+                "security_score": security, "overall_score": overall,
+                "severity": RiskEngine.classify_severity(risk, security, False, {}),
                 "analyzer_findings": [f.dict() for f in findings],
-                "quality_findings": quality_issues,
-                "security_findings": security_findings,
-                "semantic_signals": signals,
-                "technical_explanation": tech,
-                "ai_solution": solution,
-                "ai_provider": provider,
-                "technical_depth": req.technical_depth,
-                "deep_analysis_enabled": req.enable_deep_analysis,
-                "report_id": report_id,
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "quality_findings": qi, "security_findings": si,
+                "technical_explanation": tech, "ai_provider": prov,
+                "report_id": report_id, "timestamp": datetime.utcnow().isoformat() + "Z",
             }
         else:
             raise HTTPException(400, f"Invalid mode '{mode}'")
-
-        with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-
+        try:
+            with open(f"{REPORT_DIR}/{report_id}.json", "w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2, ensure_ascii=False)
+        except: pass
         return result
-
-    except ValueError as e:
-        raise HTTPException(400, f"Validation error: {str(e)}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Internal analysis error: {str(e)}")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
 
 
 @app.get("/analyze_ci")
 async def analyze_ci_get():
-    return JSONResponse(status_code=200, content={
-        "status": "OK",
-        "message": "POST-only endpoint. Send JSON body with old_code, new_code, mode.",
-        "example": {"old_code": "x > 10", "new_code": "x >= 10", "mode": "STRICT"}
-    })
-
+    return {"status": "OK", "message": "POST with {old_code, new_code, mode}"}
 
 @app.post("/analyze_ci")
 async def analyze_ci(request: Request):
     try:
         body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={
-            "status": "FAIL", "risk": 100, "findings_count": 1,
-            "summary": ["Invalid or missing JSON body"],
-            "pass": False, "warn": False, "fail": True,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        })
-
-    old_code = body.get("old_code", "")
-    new_code = body.get("new_code", "")
-    mode = str(body.get("mode", "STRICT")).upper()
-
+    except:
+        return JSONResponse(status_code=400, content={"status":"FAIL","risk":100,"summary":["Invalid JSON"],"pass":False,"warn":False,"fail":True})
+    old_code = body.get("old_code",""); new_code = body.get("new_code",""); mode = str(body.get("mode","STRICT")).upper()
     if not new_code:
-        return JSONResponse(status_code=400, content={
-            "status": "FAIL", "risk": 100, "findings_count": 1,
-            "summary": ["new_code is required"],
-            "pass": False, "warn": False, "fail": True,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        })
-
-    if mode not in ["STRICT", "BOUNDARY", "CONTRACT"]:
-        mode = "STRICT"
-
+        return JSONResponse(status_code=400, content={"status":"FAIL","risk":100,"summary":["new_code required"],"pass":False,"warn":False,"fail":True})
+    mode = mode if mode in ("STRICT","BOUNDARY","CONTRACT") else "STRICT"
     try:
-        if mode == "STRICT":
-            constraints = Constraint(no_behavior_change=True, allow_boundary_change=False)
-        elif mode == "BOUNDARY":
-            constraints = Constraint(no_behavior_change=False, allow_boundary_change=True)
-        else:
-            constraints = Constraint(no_behavior_change=False, allow_boundary_change=False)
-
-        if not old_code.strip():
-            analyzer = ComplianceAnalyzer()
-            findings, raw_risk, metadata = analyzer.analyze(new_code, "")
-        else:
-            analyzer = ChangeAnalyzer()
-            findings, raw_risk, metadata = analyzer.analyze(old_code, new_code, constraints)
-
-        risk = normalize_risk(raw_risk)
-        status = get_status(risk)
-
-        quality_score, _ = CodeQualityAnalyzer().analyze(new_code)
-        security_score, _ = SecurityAnalyzer().analyze(new_code)
-        behavior = BehaviorSimulator().compare(old_code, new_code)
-        overall_score = compute_overall_score(risk, quality_score, security_score, behavior.get("behavior_score", 100))
-
-        summary = [f.findings[0] for f in findings[:5]] if findings else ["No issues detected"]
-
-        response = {
-            "risk": risk,
-            "status": status,
-            "severity": compute_severity(risk),
-            "mode": mode,
-            "findings_count": len(findings),
-            "summary": summary,
-            "quality_score": quality_score,
-            "security_score": security_score,
-            "overall_score": overall_score,
-            "behavior_changed": behavior.get("changed", False),
-            "behavior_summary": behavior.get("summary", ""),
-            "pass": status == "PASS",
-            "warn": status == "WARN",
-            "fail": status == "FAIL",
-            "metadata": metadata,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-
-        return JSONResponse(content=response, status_code=200)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={
-            "status": "FAIL", "risk": 100, "findings_count": 1,
-            "summary": [f"Analysis error: {str(e)}"],
-            "pass": False, "warn": False, "fail": True,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+        constraints = {"STRICT": Constraint(no_behavior_change=True), "BOUNDARY": Constraint(allow_boundary_change=True)}.get(mode, Constraint())
+        findings, raw, meta = _intel.analyze_change(old_code, new_code, constraints) if old_code.strip() else _intel.analyze_compliance(new_code, "")
+        risk = RiskEngine.normalize(raw); status = RiskEngine.status(risk)
+        quality, _ = _qual.analyze(new_code); security, _ = _sec.analyze(new_code)
+        behavior   = _intel.compare_behavior(old_code, new_code)
+        overall    = RiskEngine.overall(risk, quality, security, behavior.get("behavior_score",100))
+        severity   = RiskEngine.classify_severity(risk, security, behavior.get("changed",False), {})
+        return JSONResponse(content={
+            "risk": risk, "status": status, "mode": mode, "severity": severity,
+            "findings_count": len(findings), "summary": [f.findings[0] for f in findings[:5]] or ["No issues"],
+            "quality_score": quality, "security_score": security, "overall_score": overall,
+            "behavior_changed": behavior.get("changed",False),
+            "pass": status=="PASS", "warn": status=="WARN", "fail": status=="FAIL",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
         })
-
-
-# ============================================================================
-# NEW ENDPOINT — /analyze_full
-# ============================================================================
-
-@app.post("/analyze_full")
-async def analyze_full(req: FullAnalyzeRequest):
-    try:
-        result = await run_full_analysis(req.old_code, req.new_code, req.mode)
-        return result
     except Exception as e:
-        raise HTTPException(500, f"Full analysis error: {str(e)}")
+        return JSONResponse(status_code=500, content={"status":"FAIL","risk":100,"summary":[str(e)],"pass":False,"warn":False,"fail":True})
 
 
+# ── REPORT ENDPOINTS ─────────────────────────────────────────────────────────
 @app.get("/report/store/{report_id}")
-async def get_report_from_store(report_id: str):
+async def report_store(report_id: str):
     if report_id in REPORT_STORE:
         return JSONResponse(content=REPORT_STORE[report_id])
     path = f"{REPORT_DIR}/{report_id}.json"
     if os.path.exists(path):
-        with open(path, encoding='utf-8') as f:
-            return JSONResponse(content=json.load(f))
+        with open(path, encoding="utf-8") as fh:
+            return JSONResponse(content=json.load(fh))
     raise HTTPException(404, f"Report not found: {report_id}")
 
-
-# ============================================================================
-# REPORT ENDPOINTS
-# ============================================================================
-
 @app.get("/report/json/{report_id}")
-async def download_json(report_id: str):
+async def report_json(report_id: str):
     path = f"{REPORT_DIR}/{report_id}.json"
-    if not os.path.exists(path):
-        raise HTTPException(404, f"Report not found: {report_id}")
-    with open(path, encoding='utf-8') as f:
-        return JSONResponse(content=json.load(f), headers={"Content-Disposition": f'attachment; filename="cronos_report_{report_id}.json"'})
+    if not os.path.exists(path): raise HTTPException(404, f"Not found: {report_id}")
+    with open(path, encoding="utf-8") as fh:
+        return JSONResponse(content=json.load(fh), headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.json"'})
 
 @app.get("/report/pdf/{report_id}")
-async def download_pdf(report_id: str):
-    json_path = f"{REPORT_DIR}/{report_id}.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(404, f"Report not found: {report_id}")
-    with open(json_path, encoding='utf-8') as f:
-        data = json.load(f)
-    buffer = generate_professional_pdf(data)
-    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="cronos_report_{report_id}.pdf"'})
+async def report_pdf(report_id: str):
+    path = f"{REPORT_DIR}/{report_id}.json"
+    if not os.path.exists(path): raise HTTPException(404, f"Not found: {report_id}")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return StreamingResponse(_generate_pdf(data), media_type="application/pdf",
+                             headers={"Content-Disposition": f'attachment; filename="cronos_{report_id}.pdf"'})
 
 
-# ============================================================================
-# HEALTH CHECK
-# ============================================================================
-
+# ── HEALTH ───────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
     return {
         "status": "ok",
-        # BUG FIX 4: version string now matches FastAPI(..., version="8.0.0") above
-        "service": "CRONOS v8.0.0 — Advanced Intelligence Code Analyzer",
-        "description": "SonarQube + GitHub Advanced Security + Semantic Execution Predictor",
-        "intelligence_layers": {
-            "layer_1": "Static Risk Analysis (AST-based change detection)",
-            "layer_2": "Code Quality Analysis (complexity, dead code, nesting)",
-            "layer_3": "Security Vulnerability Detection (OWASP, CWE)",
-            "layer_4": "Execution Outcome Prediction (AST simulation)",
-            "layer_5": "AI Semantic Explanation (Gemini/OpenRouter)"
-        },
+        "service": "CRONOS v8.0.0 — Enterprise Intelligence Code Analyzer",
+        "version": "8.0.0",
         "features": {
-            "gemini": gemini_model is not None,
-            "openrouter": OPENROUTER_ENABLED,
-            "analyzers": ["ChangeAnalyzer", "ComplianceAnalyzer", "CodeQualityAnalyzer", "SecurityAnalyzer", "ExecutionPredictor", "BehaviorSimulator"],
-            "modes": ["STRICT", "BOUNDARY", "CONTRACT"],
-            "analysis_levels": ["BASIC (/analyze_ci)", "ADVANCED (/analyze)", "FULL (/analyze_full)"]
+            "feature_1": "Automatic PR Comments (POST /github/pr_comment)",
+            "feature_2": "Inline Code Annotations (POST /github/check_run)",
+            "feature_3": "Security Severity Classification (severity field in all responses)",
+            "feature_4": "Historical Trend Tracking (GET /history/{repo}, GET /trend/{repo})",
+            "feature_5": "Dashboard UI Backend (GET /dashboard/*)",
+            "feature_6": "IDE Plugin Support (POST /analyze_realtime)",
         },
         "endpoints": {
-            "POST /analyze": "Advanced analysis (CHANGE/COMPLIANCE) + quality + security scores",
-            "POST /analyze_ci": "CI/CD fast analysis — all scores included",
-            "POST /analyze_full": "Full 5-layer intelligence report",
-            "GET /analyze_ci": "Health check / usage info",
-            "GET /report/json/{id}": "Download JSON report",
-            "GET /report/pdf/{id}": "Download PDF report"
+            "POST /analyze_full":       "Full 6-layer enterprise intelligence report",
+            "POST /analyze_realtime":   "IDE plugin — sub-2s analysis",
+            "POST /analyze":            "Advanced analysis (CHANGE/COMPLIANCE)",
+            "POST /analyze_ci":         "CI/CD fast gate",
+            "POST /github/pr_comment":  "Post PR intelligence comment",
+            "POST /github/check_run":   "Create Check Run with annotations",
+            "GET  /history/{repo}":     "Historical reports",
+            "GET  /trend/{repo}":       "Trend data for dashboard",
+            "GET  /dashboard/summary":  "Dashboard summary",
+            "GET  /dashboard/recent":   "Recent reports",
+            "GET  /dashboard/high_risk":"High risk reports",
+            "GET  /report/json/{id}":   "Download JSON report",
+            "GET  /report/pdf/{id}":    "Download PDF report",
+            "GET  /report/store/{id}":  "In-memory report retrieval",
         },
-        "score_system": {
-            "risk_score": "0-100 (lower = safer)",
-            "quality_score": "0-100 (higher = better quality)",
-            "security_score": "0-100 (higher = more secure)",
-            "behavior_score": "0-100 (higher = less behavioral change)",
-            "overall_score": "0-100 (weighted combination of all)"
-        }
+        "security": {
+            "zero_code_retention": True,
+            "code_stored_on_disk": False,
+            "hashes_only": True,
+        },
+        "intelligence": {
+            "gemini":     bool(GEMINI_API_KEY),
+            "openrouter": OPENROUTER_ENABLED,
+            "layers": ["IntelligenceEngine", "CodeQualityAnalyzer", "SecurityAnalyzer",
+                       "ExecutionPredictor", "AIExplainer", "RiskEngine"],
+        },
     }
 
 
+# ── STARTUP ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
-async def startup_event():
+async def startup():
+    _init_db()
     print("=" * 80)
-    # BUG FIX 4: startup banner now consistent with version="8.0.0"
-    print("✅ CRONOS v8.0.0 — ADVANCED INTELLIGENCE CODE ANALYZER")
+    print("✅ CRONOS v8.0.0 — ENTERPRISE INTELLIGENCE CODE ANALYZER")
     print("=" * 80)
-    print(f"📁 Report directory: {REPORT_DIR}")
-    print(f"🤖 Gemini: {'✅ Enabled' if gemini_model else '❌ Disabled'}")
+    print(f"🤖 Gemini    : {'✅ Enabled' if GEMINI_API_KEY else '❌ Disabled'}")
     print(f"🤖 OpenRouter: {'✅ Enabled' if OPENROUTER_ENABLED else '❌ Disabled'}")
+    print(f"🗄️  Database  : {DB_PATH}")
     print()
-    print("🧠 INTELLIGENCE LAYERS:")
-    print("  ✓ Layer 1 — Static Risk Analysis (AST change detection)")
-    print("  ✓ Layer 2 — Code Quality Analysis (complexity, dead code)")
-    print("  ✓ Layer 3 — Security Vulnerability Detection (CWE/OWASP)")
-    print("  ✓ Layer 4 — Execution Outcome Prediction (AST simulation)")
-    print("  ✓ Layer 5 — AI Semantic Explanation (Gemini/OpenRouter)")
+    print("🏢 ENTERPRISE FEATURES:")
+    print("  ✓ F1 — Automatic PR Comments")
+    print("  ✓ F2 — Inline Code Annotations (Check Runs)")
+    print("  ✓ F3 — Security Severity Classification (CRITICAL/HIGH/MEDIUM/LOW/SAFE)")
+    print("  ✓ F4 — Historical Trend Tracking (SQLite)")
+    print("  ✓ F5 — Dashboard UI Backend")
+    print("  ✓ F6 — IDE Plugin Support (realtime < 2s)")
     print()
-    print("🚀 ENDPOINTS:")
-    print("  • POST /analyze       — Advanced analysis")
-    print("  • POST /analyze_ci    — CI/CD optimized")
-    print("  • POST /analyze_full  — Full 5-layer intelligence report")
-    print("  • GET  /analyze_ci    — Health check")
-    print("  • GET  /report/json/{id} — JSON download")
-    print("  • GET  /report/pdf/{id}  — PDF download")
-    print()
-    print("🎓 READY FOR PRODUCTION — SonarQube + Security + Execution Prediction")
+    print("🔒 ZERO CODE RETENTION — source code never persisted")
     print("=" * 80)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
