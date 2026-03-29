@@ -166,7 +166,7 @@ class RealtimeAnalyzeRequest(BaseModel):
 # ███████║███████║███████╗███████║    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗
 # ██╔══██║██╔══██║╚════██║██╔══██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝
 # ██║  ██║██║  ██║███████║██║  ██║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗
-# ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
+# ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝    ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
 # ============================================================================
 
 class HashEngine:
@@ -852,6 +852,7 @@ class SecurityAnalyzer:
         return f
 
     def _insecure_rng(self, tree):
+        f = [] # Initialize findings list
         for n in ast.walk(tree):
             if isinstance(n, ast.Call):
                 nm = ""
@@ -860,8 +861,9 @@ class SecurityAnalyzer:
                 if nm in self.INSECURE_RNG:
                     if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == 'secrets':
                         continue
-                    return [{"type": "InsecureRandom", "message": f"random.{nm}() — use secrets module", "severity": "medium", "cwe": "CWE-338"}]
-        return []
+                    # APPEND instead of return
+                    f.append({"type": "InsecureRandom", "message": f"random.{nm}() — use secrets module", "severity": "medium", "cwe": "CWE-338"})
+        return f # Return the full list
 
     def _subprocess(self, tree):
         f = []
@@ -1065,10 +1067,16 @@ Respond ONLY with this exact JSON (no markdown, no extra keys):
 }}"""
         try:
             raw, provider = _ai(prompt)
-            clean = raw.strip()
-            if clean.startswith("```"): clean = "\n".join(clean.split("\n")[1:])
-            if clean.endswith("```"):   clean = "\n".join(clean.split("\n")[:-1])
-            parsed = json.loads(clean.strip())
+            
+            # Bulletproof JSON extraction
+            start = raw.find('{')
+            end = raw.rfind('}')
+            if start != -1 and end != -1:
+                clean = raw[start:end+1]
+            else:
+                clean = "{}"
+                
+            parsed = json.loads(clean)
             return {
                 "technical_explanation": str(parsed.get("technical_explanation", "")),
                 "human_explanation":     str(parsed.get("human_explanation", "")),
@@ -1093,7 +1101,15 @@ Return ONLY JSON:
 {{"technical_explanation":"...","human_explanation":"...","risk_reasoning":"...","behavioral_impact":"..."}}"""
         try:
             raw, provider = _ai(prompt)
-            clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
+            
+            # Bulletproof JSON extraction
+            start = raw.find('{')
+            end = raw.rfind('}')
+            if start != -1 and end != -1:
+                clean = raw[start:end+1]
+            else:
+                clean = "{}"
+
             parsed = json.loads(clean)
             return {**{k: str(parsed.get(k,"")) for k in ("technical_explanation","human_explanation","risk_reasoning","behavioral_impact")}, "ai_provider": provider}
         except:
@@ -1342,17 +1358,17 @@ async def run_full_analysis(
     if cache_key in HASH_CACHE:
         scores = HASH_CACHE[cache_key]
         cached = {
-            "status":          RiskEngine.status(scores["risk_score"]),
-            "risk":            scores["risk_score"],
-            "risk_score":      scores["risk_score"],
-            "quality_score":   scores["quality_score"],
-            "security_score":  scores["security_score"],
-            "overall_score":   scores["overall_score"],
-            "severity":        scores["severity"],
-            "mode":            mode,
-            "old_hash":        old_hash,
-            "new_hash":        new_hash,
-            "semantic_hash":   semantic_hash,
+            "status":         RiskEngine.status(scores["risk_score"]),
+            "risk":           scores["risk_score"],
+            "risk_score":     scores["risk_score"],
+            "quality_score":  scores["quality_score"],
+            "security_score": scores["security_score"],
+            "overall_score":  scores["overall_score"],
+            "severity":       scores["severity"],
+            "mode":           mode,
+            "old_hash":       old_hash,
+            "new_hash":       new_hash,
+            "semantic_hash":  semantic_hash,
             "pass":  RiskEngine.status(scores["risk_score"]) == "PASS",
             "warn":  RiskEngine.status(scores["risk_score"]) == "WARN",
             "fail":  RiskEngine.status(scores["risk_score"]) == "FAIL",
@@ -1895,7 +1911,7 @@ async def startup():
     print("=" * 80)
     print("✅ CRONOS v8.0.0 — ENTERPRISE INTELLIGENCE CODE ANALYZER")
     print("=" * 80)
-    print(f"🤖 Gemini    : {'✅ Enabled' if GEMINI_API_KEY else '❌ Disabled'}")
+    print(f"🤖 Gemini     : {'✅ Enabled' if GEMINI_API_KEY else '❌ Disabled'}")
     print(f"🤖 OpenRouter: {'✅ Enabled' if OPENROUTER_ENABLED else '❌ Disabled'}")
     print(f"🗄️  Database  : {DB_PATH}")
     print()
